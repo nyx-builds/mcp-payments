@@ -1,6 +1,6 @@
 [project]
 name = "mcp-payments"
-version = "0.1.0"
+version = "0.1.1"
 description = "Payment execution layer for AI agents. MCP server + CLI. Create, charge, and verify payments. x402-ready."
 readme = "README.md"
 license = { text = "MIT" }

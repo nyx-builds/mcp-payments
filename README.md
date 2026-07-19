@@ -4,6 +4,11 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml)
+[![131 tests](https://img.shields.io/badge/tests-131%20passing-brightgreen.svg)](#)
+[![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](https://modelcontextprotocol.io)
+[![x402](https://img.shields.io/badge/x402-ready-orange.svg)](https://github.com/x402-protocol)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](#)
 
 ## Why?
 
