@@ -11,6 +11,8 @@ from typing import Any, Optional
 from .models import (
     Currency,
     Customer,
+    Escrow,
+    EscrowStatus,
     Payment,
     PaymentIntent,
     PaymentProvider,
@@ -20,6 +22,9 @@ from .models import (
     PricingModel,
     Refund,
     RefundStatus,
+    SplitPayment,
+    SplitShare,
+    SplitStatus,
     ToolPricing,
     X402PaymentRequirements,
 )
@@ -429,3 +434,274 @@ class PaymentEngine:
         """Verify a webhook HMAC signature with timestamp tolerance."""
         expected = self.generate_webhook_signature(payload, secret)
         return hmac.compare_digest(expected, signature)
+
+    # ── Escrow (v0.2.0 — agent-to-agent trust) ─────────────────────────
+
+    def create_escrow(
+        self,
+        payer_customer_id: str,
+        payee_customer_id: str,
+        amount: float,
+        currency: Currency = Currency.USD,
+        task_description: str = "",
+        task_id: str | None = None,
+        tool_name: str | None = None,
+        expires_in_seconds: int | None = None,
+        metadata: dict | None = None,
+    ) -> Escrow:
+        """Create an escrow that holds funds until a task completes.
+
+        Funds are charged from the payer immediately and held. The payer
+        releases when satisfied, or funds are refunded if expired/disputed.
+        """
+        # Validate both customers exist
+        payer = self.storage.get_customer(payer_customer_id)
+        payee = self.storage.get_customer(payee_customer_id)
+        if payer is None:
+            raise ValueError(f"Payer not found: {payer_customer_id}")
+        if payee is None:
+            raise ValueError(f"Payee not found: {payee_customer_id}")
+        if payer_customer_id == payee_customer_id:
+            raise ValueError("Payer and payee must be different")
+
+        # Charge the payer — funds go into escrow, not to the payee yet
+        funding_payment = self.charge(
+            customer_id=payer_customer_id,
+            amount=amount,
+            currency=currency,
+            tool_name=tool_name,
+            description=f"[ESCROW] {task_description}",
+            metadata={"escrow": True, **(metadata or {})},
+        )
+
+        if funding_payment.status != PaymentStatus.SUCCEEDED:
+            raise ValueError(
+                f"Escrow funding failed: {funding_payment.failure_reason or funding_payment.status.value}"
+            )
+
+        expires_at = None
+        if expires_in_seconds is not None:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+
+        escrow = Escrow(
+            payer_customer_id=payer_customer_id,
+            payee_customer_id=payee_customer_id,
+            amount=amount,
+            currency=currency,
+            task_description=task_description,
+            task_id=task_id,
+            tool_name=tool_name,
+            expires_at=expires_at,
+            payment_id=funding_payment.id,
+            metadata=metadata or {},
+        )
+        return self.storage.create_escrow(escrow)
+
+    def release_escrow(self, escrow_id: str) -> Optional[Escrow]:
+        """Release escrow funds to the payee."""
+        escrow = self.storage.get_escrow(escrow_id)
+        if escrow is None:
+            return None
+        if escrow.status != EscrowStatus.HELD:
+            raise ValueError(f"Cannot release escrow with status: {escrow.status.value}")
+
+        # Credit the payee's balance
+        self.storage.update_customer_balance(escrow.payee_customer_id, escrow.amount)
+
+        # Record the release payment
+        release_payment = Payment(
+            customer_id=escrow.payee_customer_id,
+            amount=escrow.amount,
+            currency=escrow.currency,
+            status=PaymentStatus.SUCCEEDED,
+            provider=PaymentProvider.INTERNAL,
+            tool_name=escrow.tool_name,
+            description=f"[ESCROW RELEASE] {escrow.task_description}",
+            completed_at=datetime.now(timezone.utc),
+            provider_transaction_id=f"esc_rel_{uuid.uuid4().hex[:16]}",
+        )
+        self.storage.create_payment(release_payment)
+
+        updated = self.storage.update_escrow(
+            escrow_id,
+            status=EscrowStatus.RELEASED,
+            released_at=datetime.now(timezone.utc),
+            release_payment_id=release_payment.id,
+        )
+        return updated
+
+    def refund_escrow(self, escrow_id: str, reason: str = "") -> Optional[Escrow]:
+        """Refund escrow funds back to the payer (e.g. task not completed)."""
+        escrow = self.storage.get_escrow(escrow_id)
+        if escrow is None:
+            return None
+        if escrow.status != EscrowStatus.HELD:
+            raise ValueError(f"Cannot refund escrow with status: {escrow.status.value}")
+
+        # Credit the payer back
+        self.storage.update_customer_balance(escrow.payer_customer_id, escrow.amount)
+
+        return self.storage.update_escrow(
+            escrow_id,
+            status=EscrowStatus.REFUNDED,
+            refunded_at=datetime.now(timezone.utc),
+            dispute_reason=reason or None,
+        )
+
+    def dispute_escrow(self, escrow_id: str, reason: str) -> Optional[Escrow]:
+        """Mark an escrow as disputed (payee claims non-release by payer)."""
+        escrow = self.storage.get_escrow(escrow_id)
+        if escrow is None:
+            return None
+        if escrow.status not in (EscrowStatus.HELD,):
+            raise ValueError(f"Cannot dispute escrow with status: {escrow.status.value}")
+        return self.storage.update_escrow(
+            escrow_id, status=EscrowStatus.DISPUTED, dispute_reason=reason
+        )
+
+    def auto_expire_escrows(self) -> list[Escrow]:
+        """Auto-refund any escrows past their expiry time. Returns refunded list."""
+        now = datetime.now(timezone.utc)
+        expired = []
+        all_escrows = self.storage.list_escrows(status=EscrowStatus.HELD.value, limit=10000)
+        for esc in all_escrows:
+            if esc.expires_at and now > esc.expires_at:
+                refunded = self.refund_escrow(esc.id, reason="Auto-expired")
+                if refunded:
+                    expired.append(refunded)
+        return expired
+
+    def get_escrow(self, escrow_id: str) -> Optional[Escrow]:
+        return self.storage.get_escrow(escrow_id)
+
+    def list_escrows(
+        self,
+        payer_id: str | None = None,
+        payee_id: str | None = None,
+        status: str | None = None,
+    ) -> list[Escrow]:
+        status_val = status.value if hasattr(status, "value") else status
+        return self.storage.list_escrows(payer_id=payer_id, payee_id=payee_id, status=status_val)
+
+    # ── Split Payments (v0.2.0 — multi-recipient settlement) ───────────
+
+    def create_split(
+        self,
+        payer_customer_id: str,
+        shares: list[dict[str, Any]],
+        currency: Currency = Currency.USD,
+        source_payment_id: str | None = None,
+        tool_name: str | None = None,
+        description: str = "",
+        metadata: dict | None = None,
+        auto_settle: bool = True,
+    ) -> SplitPayment:
+        """Create a split payment that distributes funds to multiple recipients.
+
+        ``shares`` is a list of dicts: ``{"customer_id": "...", "amount": 7.00, "label": "provider"}``
+        or ``{"customer_id": "...", "percentage": 70, "label": "provider"}``.
+
+        If percentages are given, they are computed from the total (sum of amounts or source payment).
+        """
+        # Validate payer
+        payer = self.storage.get_customer(payer_customer_id)
+        if payer is None:
+            raise ValueError(f"Payer not found: {payer_customer_id}")
+
+        # Normalize shares: if percentage given without amount, compute from total
+        parsed_shares: list[SplitShare] = []
+        total_from_amounts = sum(s.get("amount", 0) for s in shares)
+
+        # Determine the base total
+        if total_from_amounts > 0:
+            base_total = total_from_amounts
+        elif source_payment_id:
+            src = self.storage.get_payment(source_payment_id)
+            if src is None:
+                raise ValueError(f"Source payment not found: {source_payment_id}")
+            base_total = src.amount
+        else:
+            raise ValueError("Cannot determine total: provide amounts or source_payment_id")
+
+        for s in shares:
+            cid = s["customer_id"]
+            amt = s.get("amount")
+            pct = s.get("percentage")
+            if amt is None and pct is not None:
+                amt = round(base_total * pct / 100, 2)
+            if amt is None:
+                raise ValueError(f"Share for {cid} has no amount or percentage")
+            parsed_shares.append(SplitShare(
+                customer_id=cid, amount=amt, percentage=pct, label=s.get("label", "")
+            ))
+
+        total_shares = sum(s.amount for s in parsed_shares)
+
+        split = SplitPayment(
+            payer_customer_id=payer_customer_id,
+            total_amount=total_shares,
+            currency=currency,
+            shares=parsed_shares,
+            source_payment_id=source_payment_id,
+            tool_name=tool_name,
+            description=description,
+            metadata=metadata or {},
+        )
+        created = self.storage.create_split(split)
+
+        if auto_settle:
+            self.settle_split(created.id)
+            created = self.storage.get_split(created.id) or created
+
+        return created
+
+    def settle_split(self, split_id: str) -> Optional[SplitPayment]:
+        """Execute the split: credit each recipient."""
+        split = self.storage.get_split(split_id)
+        if split is None:
+            return None
+        if split.status in (SplitStatus.COMPLETED, SplitStatus.PARTIALLY_COMPLETED):
+            return split
+
+        settlement_ids: list[str] = []
+        all_ok = True
+
+        for share in split.shares:
+            recipient = self.storage.get_customer(share.customer_id)
+            if recipient is None:
+                all_ok = False
+                continue
+            # Credit recipient balance
+            self.storage.update_customer_balance(share.customer_id, share.amount)
+            # Record settlement payment
+            pay = Payment(
+                customer_id=share.customer_id,
+                amount=share.amount,
+                currency=split.currency,
+                status=PaymentStatus.SUCCEEDED,
+                provider=PaymentProvider.INTERNAL,
+                tool_name=split.tool_name,
+                description=f"[SPLIT] {share.label or split.description}",
+                completed_at=datetime.now(timezone.utc),
+                provider_transaction_id=f"spl_{uuid.uuid4().hex[:16]}",
+                metadata={"split_id": split_id},
+            )
+            self.storage.create_payment(pay)
+            settlement_ids.append(pay.id)
+
+        new_status = SplitStatus.COMPLETED if all_ok else SplitStatus.PARTIALLY_COMPLETED
+        return self.storage.update_split(
+            split_id,
+            status=new_status,
+            completed_at=datetime.now(timezone.utc),
+            settlement_payment_ids=settlement_ids,
+        )
+
+    def get_split(self, split_id: str) -> Optional[SplitPayment]:
+        return self.storage.get_split(split_id)
+
+    def list_splits(
+        self, payer_id: str | None = None, status: str | None = None
+    ) -> list[SplitPayment]:
+        status_val = status.value if hasattr(status, "value") else status
+        return self.storage.list_splits(payer_id=payer_id, status=status_val)

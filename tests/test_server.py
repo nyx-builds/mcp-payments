@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 16
+        assert len(TOOL_DEFINITIONS) == 23
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -45,6 +45,10 @@ class TestToolDefinitions:
             "get_payment", "verify_payment", "refund_payment",
             "get_receipt", "list_payments", "payment_summary",
             "create_x402_response",
+            # v0.2.0
+            "create_escrow", "release_escrow", "refund_escrow",
+            "get_escrow", "list_escrows",
+            "create_split", "get_split",
         }
         assert names == expected
 
@@ -52,7 +56,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 16
+        assert len(tools) == 23
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()

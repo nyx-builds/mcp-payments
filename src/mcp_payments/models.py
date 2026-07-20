@@ -191,3 +191,74 @@ class PaymentReceipt(BaseModel):
     completed_at: datetime
     transaction_id: Optional[str] = None
     signature: Optional[str] = Field(default=None, description="Optional cryptographic signature for verification")
+
+
+# ── v0.2.0: Escrow + Split Payments (agent-to-agent) ───────────────────────
+
+class EscrowStatus(str, Enum):
+    HELD = "held"
+    RELEASED = "released"
+    REFUNDED = "refunded"
+    DISPUTED = "disputed"
+
+
+class SplitStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    PARTIALLY_COMPLETED = "partially_completed"
+    FAILED = "failed"
+
+
+class Escrow(BaseModel):
+    """Escrow holds funds until a task between agents completes.
+
+    Agent A funds escrow → Agent B performs a task → Agent A releases
+    (or Agent B disputes a non-release). Solves the trust gap in
+    agent-to-agent transactions.
+    """
+    id: str = Field(default_factory=lambda: f"esc_{uuid.uuid4().hex[:24]}")
+    payer_customer_id: str
+    payee_customer_id: str
+    amount: float = Field(..., ge=0)
+    currency: Currency = Field(default=Currency.USD)
+    status: EscrowStatus = Field(default=EscrowStatus.HELD)
+    task_description: str = Field(default="", description="What the payee must do to earn release")
+    task_id: Optional[str] = Field(default=None, description="External task / job ID")
+    tool_name: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    released_at: Optional[datetime] = Field(default=None)
+    refunded_at: Optional[datetime] = Field(default=None)
+    expires_at: Optional[datetime] = Field(default=None, description="Auto-refund if not released by this time")
+    payment_id: Optional[str] = Field(default=None, description="Funding payment ID")
+    release_payment_id: Optional[str] = Field(default=None, description="Payment to payee on release")
+    dispute_reason: Optional[str] = Field(default=None)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SplitShare(BaseModel):
+    """A single recipient's share of a split payment."""
+    customer_id: str
+    amount: float = Field(..., ge=0)
+    percentage: Optional[float] = Field(default=None, description="Optional percentage (0-100) for reference")
+    label: str = Field(default="")
+
+
+class SplitPayment(BaseModel):
+    """Split a single charge across multiple recipients.
+
+    e.g. Charge $10 → $7 to the tool provider, $2 to the platform fee,
+    $1 to a referrer. One payment in, many ledger credits out.
+    """
+    id: str = Field(default_factory=lambda: f"spl_{uuid.uuid4().hex[:24]}")
+    payer_customer_id: str
+    total_amount: float = Field(..., ge=0)
+    currency: Currency = Field(default=Currency.USD)
+    shares: list[SplitShare] = Field(default_factory=list)
+    status: SplitStatus = Field(default=SplitStatus.PENDING)
+    source_payment_id: Optional[str] = Field(default=None, description="Original payment being split")
+    tool_name: Optional[str] = Field(default=None)
+    description: str = Field(default="")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = Field(default=None)
+    settlement_payment_ids: list[str] = Field(default_factory=list, description="Payment IDs credited to each share")
+    metadata: dict[str, Any] = Field(default_factory=dict)

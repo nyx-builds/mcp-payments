@@ -191,6 +191,104 @@ TOOL_DEFINITIONS = [
             "required": ["amount"],
         },
     },
+    {
+        "name": "create_escrow",
+        "description": "Create an escrow that holds funds until a task between agents completes. Agent A funds escrow → Agent B does the task → Agent A releases. Solves agent-to-agent trust.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payer_customer_id": {"type": "string", "description": "Customer ID of the paying agent"},
+                "payee_customer_id": {"type": "string", "description": "Customer ID of the agent doing the work"},
+                "amount": {"type": "number", "description": "Amount to hold in escrow"},
+                "currency": {"type": "string", "enum": [c.value for c in Currency], "default": "USD"},
+                "task_description": {"type": "string", "description": "What the payee must do to earn release"},
+                "task_id": {"type": "string", "description": "External task/job ID (optional)"},
+                "tool_name": {"type": "string"},
+                "expires_in_seconds": {"type": "integer", "description": "Auto-refund if not released by this time"},
+            },
+            "required": ["payer_customer_id", "payee_customer_id", "amount"],
+        },
+    },
+    {
+        "name": "release_escrow",
+        "description": "Release escrow funds to the payee — call when the task is complete and you're satisfied.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"escrow_id": {"type": "string"}},
+            "required": ["escrow_id"],
+        },
+    },
+    {
+        "name": "refund_escrow",
+        "description": "Refund escrow funds back to the payer — call if the task was not completed or was rejected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "escrow_id": {"type": "string"},
+                "reason": {"type": "string", "default": ""},
+            },
+            "required": ["escrow_id"],
+        },
+    },
+    {
+        "name": "get_escrow",
+        "description": "Check the status of an escrow.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"escrow_id": {"type": "string"}},
+            "required": ["escrow_id"],
+        },
+    },
+    {
+        "name": "list_escrows",
+        "description": "List escrows, optionally filtered by payer, payee, or status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payer_id": {"type": "string"},
+                "payee_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["held", "released", "refunded", "disputed"]},
+            },
+        },
+    },
+    {
+        "name": "create_split",
+        "description": "Split a payment across multiple recipients. e.g. Charge $10 → $7 to provider, $2 platform fee, $1 referrer. One charge in, many credits out.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payer_customer_id": {"type": "string"},
+                "shares": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "customer_id": {"type": "string"},
+                            "amount": {"type": "number", "description": "Fixed amount (use this OR percentage)"},
+                            "percentage": {"type": "number", "description": "Percentage of total (0-100). Use this OR amount."},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["customer_id"],
+                    },
+                    "description": "List of recipients and their shares",
+                },
+                "currency": {"type": "string", "enum": [c.value for c in Currency], "default": "USD"},
+                "source_payment_id": {"type": "string", "description": "Existing payment to split (optional)"},
+                "tool_name": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["payer_customer_id", "shares"],
+        },
+    },
+    {
+        "name": "get_split",
+        "description": "Check the status of a split payment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"split_id": {"type": "string"}},
+            "required": ["split_id"],
+        },
+    },
 ]
 
 
@@ -412,3 +510,142 @@ class MCPServer:
             network=args.get("network", "base-sepolia"),
         )
         return req.model_dump()
+
+    # ── v0.2.0: Escrow + Split handlers ───────────────────────────────
+
+    def _tool_create_escrow(self, args: dict) -> dict:
+        escrow = self.engine.create_escrow(
+            payer_customer_id=args["payer_customer_id"],
+            payee_customer_id=args["payee_customer_id"],
+            amount=args["amount"],
+            currency=Currency(args.get("currency", "USD")),
+            task_description=args.get("task_description", ""),
+            task_id=args.get("task_id"),
+            tool_name=args.get("tool_name"),
+            expires_in_seconds=args.get("expires_in_seconds"),
+        )
+        return {
+            "escrow_id": escrow.id,
+            "status": escrow.status.value,
+            "amount": escrow.amount,
+            "currency": escrow.currency.value,
+            "payer": escrow.payer_customer_id,
+            "payee": escrow.payee_customer_id,
+            "task_description": escrow.task_description,
+            "expires_at": escrow.expires_at.isoformat() if escrow.expires_at else None,
+        }
+
+    def _tool_release_escrow(self, args: dict) -> dict:
+        escrow = self.engine.release_escrow(args["escrow_id"])
+        if escrow is None:
+            return {"error": "Escrow not found"}
+        return {
+            "escrow_id": escrow.id,
+            "status": escrow.status.value,
+            "released_at": escrow.released_at.isoformat() if escrow.released_at else None,
+            "release_payment_id": escrow.release_payment_id,
+        }
+
+    def _tool_refund_escrow(self, args: dict) -> dict:
+        escrow = self.engine.refund_escrow(args["escrow_id"], reason=args.get("reason", ""))
+        if escrow is None:
+            return {"error": "Escrow not found"}
+        return {
+            "escrow_id": escrow.id,
+            "status": escrow.status.value,
+            "refunded_at": escrow.refunded_at.isoformat() if escrow.refunded_at else None,
+        }
+
+    def _tool_get_escrow(self, args: dict) -> dict:
+        escrow = self.engine.get_escrow(args["escrow_id"])
+        if escrow is None:
+            return {"error": "Escrow not found"}
+        return {
+            "escrow_id": escrow.id,
+            "status": escrow.status.value,
+            "amount": escrow.amount,
+            "currency": escrow.currency.value,
+            "payer_customer_id": escrow.payer_customer_id,
+            "payee_customer_id": escrow.payee_customer_id,
+            "task_description": escrow.task_description,
+            "task_id": escrow.task_id,
+            "created_at": escrow.created_at.isoformat(),
+            "released_at": escrow.released_at.isoformat() if escrow.released_at else None,
+            "expires_at": escrow.expires_at.isoformat() if escrow.expires_at else None,
+            "payment_id": escrow.payment_id,
+            "release_payment_id": escrow.release_payment_id,
+            "dispute_reason": escrow.dispute_reason,
+        }
+
+    def _tool_list_escrows(self, args: dict) -> dict:
+        escrows = self.engine.list_escrows(
+            payer_id=args.get("payer_id"),
+            payee_id=args.get("payee_id"),
+            status=args.get("status"),
+        )
+        return {
+            "count": len(escrows),
+            "escrows": [
+                {
+                    "escrow_id": e.id,
+                    "status": e.status.value,
+                    "amount": e.amount,
+                    "payer": e.payer_customer_id,
+                    "payee": e.payee_customer_id,
+                    "task_description": e.task_description,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in escrows
+            ],
+        }
+
+    def _tool_create_split(self, args: dict) -> dict:
+        split = self.engine.create_split(
+            payer_customer_id=args["payer_customer_id"],
+            shares=args["shares"],
+            currency=Currency(args.get("currency", "USD")),
+            source_payment_id=args.get("source_payment_id"),
+            tool_name=args.get("tool_name"),
+            description=args.get("description", ""),
+        )
+        return {
+            "split_id": split.id,
+            "status": split.status.value,
+            "total_amount": split.total_amount,
+            "currency": split.currency.value,
+            "share_count": len(split.shares),
+            "shares": [
+                {
+                    "customer_id": s.customer_id,
+                    "amount": s.amount,
+                    "percentage": s.percentage,
+                    "label": s.label,
+                }
+                for s in split.shares
+            ],
+            "settlement_payment_ids": split.settlement_payment_ids,
+        }
+
+    def _tool_get_split(self, args: dict) -> dict:
+        split = self.engine.get_split(args["split_id"])
+        if split is None:
+            return {"error": "Split not found"}
+        return {
+            "split_id": split.id,
+            "status": split.status.value,
+            "total_amount": split.total_amount,
+            "currency": split.currency.value,
+            "payer_customer_id": split.payer_customer_id,
+            "shares": [
+                {
+                    "customer_id": s.customer_id,
+                    "amount": s.amount,
+                    "percentage": s.percentage,
+                    "label": s.label,
+                }
+                for s in split.shares
+            ],
+            "created_at": split.created_at.isoformat(),
+            "completed_at": split.completed_at.isoformat() if split.completed_at else None,
+            "settlement_payment_ids": split.settlement_payment_ids,
+        }

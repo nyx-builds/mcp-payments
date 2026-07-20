@@ -9,10 +9,12 @@ from typing import Optional
 
 from .models import (
     Customer,
+    Escrow,
     Payment,
     PaymentIntent,
     PaymentStatus,
     Refund,
+    SplitPayment,
     ToolPricing,
 )
 
@@ -30,6 +32,8 @@ class Storage:
         self._intents: dict[str, PaymentIntent] = {}
         self._refunds: dict[str, Refund] = {}
         self._tool_pricing: dict[str, ToolPricing] = {}
+        self._escrows: dict[str, Escrow] = {}
+        self._splits: dict[str, SplitPayment] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -44,6 +48,8 @@ class Storage:
             self._intents = {i["id"]: PaymentIntent(**i) for i in raw.get("intents", [])}
             self._refunds = {r["id"]: Refund(**r) for r in raw.get("refunds", [])}
             self._tool_pricing = {t["tool_name"]: ToolPricing(**t) for t in raw.get("tool_pricing", [])}
+            self._escrows = {e["id"]: Escrow(**e) for e in raw.get("escrows", [])}
+            self._splits = {s["id"]: SplitPayment(**s) for s in raw.get("splits", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -54,6 +60,8 @@ class Storage:
             "intents": [i.model_dump(mode="json") for i in self._intents.values()],
             "refunds": [r.model_dump(mode="json") for r in self._refunds.values()],
             "tool_pricing": [t.model_dump(mode="json") for t in self._tool_pricing.values()],
+            "escrows": [e.model_dump(mode="json") for e in self._escrows.values()],
+            "splits": [s.model_dump(mode="json") for s in self._splits.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -188,3 +196,80 @@ class Storage:
                 self._save()
                 return True
             return False
+
+    # ── Escrow (v0.2.0) ────────────────────────────────────────────────
+
+    def create_escrow(self, escrow: Escrow) -> Escrow:
+        with self._lock:
+            self._escrows[escrow.id] = escrow
+            self._save()
+            return escrow
+
+    def get_escrow(self, escrow_id: str) -> Optional[Escrow]:
+        with self._lock:
+            return self._escrows.get(escrow_id)
+
+    def update_escrow(self, escrow_id: str, **kwargs) -> Optional[Escrow]:
+        with self._lock:
+            e = self._escrows.get(escrow_id)
+            if e is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(e, k) and v is not None:
+                    setattr(e, k, v)
+            self._save()
+            return e
+
+    def list_escrows(
+        self,
+        payer_id: Optional[str] = None,
+        payee_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[Escrow]:
+        with self._lock:
+            results = list(self._escrows.values())
+            if payer_id:
+                results = [e for e in results if e.payer_customer_id == payer_id]
+            if payee_id:
+                results = [e for e in results if e.payee_customer_id == payee_id]
+            if status:
+                results = [e for e in results if e.status.value == status]
+            return results[:limit]
+
+    # ── Split Payments (v0.2.0) ────────────────────────────────────────
+
+    def create_split(self, split: SplitPayment) -> SplitPayment:
+        with self._lock:
+            self._splits[split.id] = split
+            self._save()
+            return split
+
+    def get_split(self, split_id: str) -> Optional[SplitPayment]:
+        with self._lock:
+            return self._splits.get(split_id)
+
+    def update_split(self, split_id: str, **kwargs) -> Optional[SplitPayment]:
+        with self._lock:
+            s = self._splits.get(split_id)
+            if s is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(s, k) and v is not None:
+                    setattr(s, k, v)
+            self._save()
+            return s
+
+    def list_splits(
+        self,
+        payer_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[SplitPayment]:
+        with self._lock:
+            results = list(self._splits.values())
+            if payer_id:
+                results = [s for s in results if s.payer_customer_id == payer_id]
+            if status:
+                results = [s for s in results if s.status.value == status]
+            return results[:limit]
