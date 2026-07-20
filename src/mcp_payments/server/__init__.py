@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from ..engine import PaymentEngine
-from ..models import Currency, PaymentProvider, PaymentStatus, PricingModel
+from ..models import Currency, PaymentProvider, PaymentStatus, PricingModel, X402PaymentRequirements
 
 
 # Tool schemas for MCP
@@ -287,6 +287,46 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {"split_id": {"type": "string"}},
             "required": ["split_id"],
+        },
+    },
+    # ── v0.3.0: x402 Billing Middleware ────────────────────────────────
+    {
+        "name": "verify_x402_payment",
+        "description": "Verify an x402 payment header. Use this to validate that an agent has paid before serving a paid resource. The payment_header is the raw base64 X-PAYMENT header value.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payment_header": {"type": "string", "description": "Base64-encoded X-PAYMENT header value"},
+                "amount": {"type": "number", "description": "Required payment amount in USD"},
+                "merchant_wallet": {"type": "string", "description": "Wallet address that should receive payment"},
+                "network": {"type": "string", "default": "base-sepolia"},
+            },
+            "required": ["payment_header", "amount"],
+        },
+    },
+    {
+        "name": "create_x402_middleware_config",
+        "description": "Generate x402 pricing middleware configuration. Returns the config needed to set up HTTP 402 payment enforcement on your ASGI app (FastAPI/Starlette). Supports multiple pricing rules for different endpoints.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "merchant_wallet": {"type": "string", "description": "Wallet address to receive payments"},
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "method": {"type": "string", "default": "GET"},
+                            "path": {"type": "string", "description": "URL path prefix to charge for"},
+                            "amount": {"type": "number", "description": "USD amount per request"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["path", "amount"],
+                    },
+                    "description": "Pricing rules for different endpoints",
+                },
+            },
+            "required": ["merchant_wallet", "rules"],
         },
     },
 ]
@@ -649,3 +689,64 @@ class MCPServer:
             "completed_at": split.completed_at.isoformat() if split.completed_at else None,
             "settlement_payment_ids": split.settlement_payment_ids,
         }
+
+    # ── v0.3.0: x402 Billing Middleware handlers ─────────────────────
+
+    def _tool_verify_x402_payment(self, args: dict) -> dict:
+        """Verify an x402 payment header against the required amount."""
+        from ..middleware import PaymentVerifier, _amount_to_atomic
+
+        verifier = PaymentVerifier(
+            merchant_wallet=args.get("merchant_wallet", self.engine.merchant_wallet),
+        )
+        requirements = X402PaymentRequirements(
+            amount=_amount_to_atomic(args["amount"]),
+            pay_to=args.get("merchant_wallet", self.engine.merchant_wallet),
+            network=args.get("network", "base-sepolia"),
+        )
+        result = verifier.verify(args["payment_header"], requirements)
+        return {
+            "valid": result.valid,
+            "reason": result.reason,
+            "transaction_id": result.transaction_id,
+        }
+
+    def _tool_create_x402_middleware_config(self, args: dict) -> dict:
+        """Generate x402 middleware pricing configuration."""
+        from ..middleware import PricingRule, _amount_to_atomic
+
+        merchant_wallet = args["merchant_wallet"]
+        rules = args["rules"]
+
+        config_rules = []
+        for r in rules:
+            config_rules.append({
+                "method": r.get("method", "GET"),
+                "path": r["path"],
+                "amount_usd": r["amount"],
+                "amount_atomic": _amount_to_atomic(r["amount"]),
+                "description": r.get("description", f"Payment for {r['path']}"),
+                "network": "base-sepolia",
+            })
+
+        return {
+            "merchant_wallet": merchant_wallet,
+            "rules": config_rules,
+            "python_snippet": (
+                "from mcp_payments.middleware import X402Middleware, PricingRule\n"
+                "from starlette.applications import Starlette\n\n"
+                f"pricing_rules = [\n"
+                + "\n".join(
+                    f"    PricingRule(method='{r['method']}', path='{r['path']}', "
+                    f"amount={r['amount_usd']}, description='{r['description']}'),"
+                    for r in config_rules
+                )
+                + "\n]\n\n"
+                "app.add_middleware(\n"
+                f"    X402Middleware,\n"
+                f"    merchant_wallet='{merchant_wallet}',\n"
+                "    pricing_rules=pricing_rules,\n"
+                ")"
+            ),
+        }
+

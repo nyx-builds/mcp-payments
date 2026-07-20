@@ -1,26 +1,26 @@
 # mcp-payments
 
-**Payment execution layer for AI agents.** MCP server + CLI. Charge, refund, escrow, split payments, and verify transactions for autonomous agents. x402-ready.
+**Payment execution layer for AI agents.** MCP server + CLI. Charge, refund, escrow, split payments, x402 billing middleware, and verify transactions for autonomous agents.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml)
-[![179 tests](https://img.shields.io/badge/tests-179%20passing-brightgreen.svg)](#)
+[![226 tests](https://img.shields.io/badge/tests-226%20passing-brightgreen.svg)](#)
 [![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](https://modelcontextprotocol.io)
 [![x402](https://img.shields.io/badge/x402-ready-orange.svg)](https://github.com/x402-protocol)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](#)
 
 ## Why?
 
-The MCP ecosystem has **no payment layer**. Agents can call tools, read resources, and generate prompts — but they can't pay for premium tools, get charged for their usage, or verify payments programmatically. As agents start transacting with each other, they also need **trust mechanisms** — escrow for task completion, split payments for multi-party settlement.
+The MCP ecosystem has **no payment layer**. Agents can call tools, read resources, and generate prompts — but they can't pay for premium tools, get charged for their usage, or verify payments programmatically. As agents start transacting with each other, they also need **trust mechanisms** — escrow for task completion, split payments for multi-party settlement, and **billing middleware** to monetize MCP endpoints via the x402 HTTP 402 protocol.
 
 **mcp-payments** fills this gap:
 - 🔧 **MCP-native** — pricing is part of tool discovery
 - 💸 **Multi-provider** — internal ledger, Stripe (fiat), x402 (crypto), on-chain
-- 🔗 **x402-ready** — generate HTTP 402 payment requirements for Coinbase's payment protocol
+- 🔗 **x402 billing middleware (NEW v0.3.0)** — enforce HTTP 402 payments on any ASGI app
 - 📊 **Full lifecycle** — pricing → intent → charge → verify → refund → receipt
-- 🔒 **Escrow (NEW v0.2.0)** — hold funds until a task between agents completes
-- ✂️ **Split payments (NEW v0.2.0)** — distribute one charge to multiple recipients
+- 🔒 **Escrow** — hold funds until a task between agents completes
+- ✂️ **Split payments** — distribute one charge to multiple recipients
 - 🏪 **Suite-compatible** — works with [agent-invoice](https://github.com/nyx-builds/agent-invoice), [agent-ledger](https://github.com/nyx-builds/agent-ledger), [agent-budget](https://github.com/nyx-builds/agent-budget)
 
 ## Quick Start
@@ -48,7 +48,58 @@ mcp-payments x402 0.01 --resource-url https://api.example.com/premium \
   --merchant-wallet 0x123...
 ```
 
-## MCP Tools (23 available)
+## x402 Billing Middleware (NEW v0.3.0)
+
+Enforce HTTP 402 payments on any ASGI app (FastAPI, Starlette). Agents that request a paid endpoint receive a `402 Payment Required` with x402 payment requirements. When they retry with a valid `X-PAYMENT` header, the middleware verifies the payment and returns the resource.
+
+```python
+from mcp_payments.middleware import X402Middleware, PricingRule
+from fastapi import FastAPI
+
+app = FastAPI()
+
+# Define pricing rules for different endpoints
+pricing_rules = [
+    PricingRule(method="GET", path="/api/premium", amount=0.01, description="Premium data"),
+    PricingRule(method="POST", path="/api/analyze", amount=0.05, description="AI analysis"),
+]
+
+app.add_middleware(
+    X402Middleware,
+    merchant_wallet="0x742d35Cc6634C0532925a3b844Bc9e7595f0bAe1",
+    pricing_rules=pricing_rules,
+)
+```
+
+**How it works:**
+
+1. Agent requests `GET /api/premium`
+2. Middleware returns `402 Payment Required`:
+```json
+{
+  "x402Version": 1,
+  "accepts": [{
+    "scheme": "exact",
+    "network": "base-sepolia",
+    "asset": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7235",
+    "amount": "10000",
+    "pay_to": "0x742d...",
+    "resource": "/api/premium",
+    "description": "Premium data"
+  }]
+}
+```
+3. Agent pays (on-chain USDC) and retries with `X-PAYMENT` header
+4. Middleware verifies payment → returns resource with `X-PAYMENT-RESPONSE` settlement confirmation
+
+**Features:**
+- Static or dynamic pricing per endpoint
+- Optional API key bypass via `check_fn`
+- HMAC signature verification for signed payments
+- Facilitator client for on-chain verification (or simulate mode for testing)
+- Path prefix stripping for versioned APIs
+
+## MCP Tools (25 available)
 
 | Tool | Description |
 |------|-------------|
@@ -68,13 +119,15 @@ mcp-payments x402 0.01 --resource-url https://api.example.com/premium \
 | `list_payments` | List with filters |
 | `payment_summary` | Analytics and revenue |
 | `create_x402_response` | Generate HTTP 402 requirements |
-| `create_escrow` | **NEW** Hold funds until task completes |
-| `release_escrow` | **NEW** Release escrow to payee |
-| `refund_escrow` | **NEW** Refund escrow to payer |
-| `get_escrow` | **NEW** Check escrow status |
-| `list_escrows` | **NEW** List/filter escrows |
-| `create_split` | **NEW** Split payment to multiple recipients |
-| `get_split` | **NEW** Check split payment status |
+| `create_escrow` | Hold funds until task completes |
+| `release_escrow` | Release escrow to payee |
+| `refund_escrow` | Refund escrow to payer |
+| `get_escrow` | Check escrow status |
+| `list_escrows` | List/filter escrows |
+| `create_split` | Split payment to multiple recipients |
+| `get_split` | Check split payment status |
+| `verify_x402_payment` | **NEW** Verify an x402 payment header |
+| `create_x402_middleware_config` | **NEW** Generate middleware pricing config |
 
 ## Escrow & Split Payments (v0.2.0)
 
@@ -137,7 +190,7 @@ split = engine.create_split(
 | Provider | Type | Status |
 |----------|------|--------|
 | `internal` | Ledger-only (prepaid balance) | ✅ Production-ready |
-| `x402` | Coinbase HTTP-native crypto | ✅ Protocol support |
+| `x402` | Coinbase HTTP-native crypto | ✅ Protocol support + middleware |
 | `stripe` | Fiat via Stripe | 🔧 Stub (requires API keys) |
 | `solana` | On-chain SOL | 🔧 Stub (requires RPC) |
 | `ethereum` | On-chain ETH | 🔧 Stub (requires RPC) |
@@ -148,12 +201,13 @@ split = engine.create_split(
 ```
 mcp-payments/
 ├── src/mcp_payments/
-│   ├── models.py       # Pydantic models (Payment, Customer, Price, etc.)
-│   ├── engine.py       # Payment processing engine
+│   ├── models.py       # Pydantic models (Payment, Customer, Price, Escrow, etc.)
+│   ├── engine.py       # Payment processing engine (charge, escrow, split)
+│   ├── middleware.py   # x402 billing middleware (NEW v0.3.0)
 │   ├── storage.py      # JSON-backed storage (swap to SQL for production)
-│   ├── server/         # MCP server (23 tools)
+│   ├── server/         # MCP server (25 tools)
 │   └── cli/            # CLI interface
-├── tests/              # Comprehensive test suite
+├── tests/              # Comprehensive test suite (226 tests)
 └── docs/               # Documentation
 ```
 

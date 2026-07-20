@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 23
+        assert len(TOOL_DEFINITIONS) == 25
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -49,6 +49,8 @@ class TestToolDefinitions:
             "create_escrow", "release_escrow", "refund_escrow",
             "get_escrow", "list_escrows",
             "create_split", "get_split",
+            # v0.3.0
+            "verify_x402_payment", "create_x402_middleware_config",
         }
         assert names == expected
 
@@ -56,7 +58,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 23
+        assert len(tools) == 25
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()
@@ -217,3 +219,57 @@ class TestToolHandlers:
             "amount": 100,
         })
         assert "error" in result
+
+    # ── v0.3.0: x402 middleware tools ─────────────────────────────────
+
+    def test_verify_x402_payment_valid(self, tmp_path):
+        from mcp_payments.middleware import make_payment_header
+        storage = Storage(data_dir=str(tmp_path / "payments"))
+        engine = PaymentEngine(storage=storage, merchant_wallet="0xMerchant")
+        srv = MCPServer(engine=engine)
+        header = make_payment_header(0.01, "0xMerchant")
+        result = srv.call_tool("verify_x402_payment", {
+            "payment_header": header,
+            "amount": 0.01,
+            "merchant_wallet": "0xMerchant",
+        })
+        assert result["result"]["valid"] is True
+        assert result["result"]["transaction_id"]
+
+    def test_verify_x402_payment_invalid_amount(self, tmp_path):
+        from mcp_payments.middleware import make_payment_header
+        storage = Storage(data_dir=str(tmp_path / "payments"))
+        engine = PaymentEngine(storage=storage, merchant_wallet="0xMerchant")
+        srv = MCPServer(engine=engine)
+        header = make_payment_header(0.99, "0xMerchant")  # Wrong amount
+        result = srv.call_tool("verify_x402_payment", {
+            "payment_header": header,
+            "amount": 0.01,
+            "merchant_wallet": "0xMerchant",
+        })
+        assert result["result"]["valid"] is False
+        assert "Amount mismatch" in result["result"]["reason"]
+
+    def test_verify_x402_payment_no_header(self, tmp_path):
+        storage = Storage(data_dir=str(tmp_path / "payments"))
+        engine = PaymentEngine(storage=storage, merchant_wallet="0xMerchant")
+        srv = MCPServer(engine=engine)
+        result = srv.call_tool("verify_x402_payment", {
+            "payment_header": "",
+            "amount": 0.01,
+        })
+        assert result["result"]["valid"] is False
+
+    def test_create_x402_middleware_config(self, server):
+        result = server.call_tool("create_x402_middleware_config", {
+            "merchant_wallet": "0xMerchant",
+            "rules": [
+                {"method": "GET", "path": "/api/data", "amount": 0.01},
+                {"method": "POST", "path": "/api/analyze", "amount": 0.05},
+            ],
+        })
+        assert "result" in result
+        assert result["result"]["merchant_wallet"] == "0xMerchant"
+        assert len(result["result"]["rules"]) == 2
+        assert result["result"]["rules"][0]["amount_atomic"] == "10000"
+        assert "X402Middleware" in result["result"]["python_snippet"]
