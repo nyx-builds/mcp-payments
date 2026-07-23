@@ -5,10 +5,10 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml)
-[![226 tests](https://img.shields.io/badge/tests-226%20passing-brightgreen.svg)](#)
+[![319 tests](https://img.shields.io/badge/tests-319%20passing-brightgreen.svg)](#)
 [![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](https://modelcontextprotocol.io)
 [![x402](https://img.shields.io/badge/x402-ready-orange.svg)](https://github.com/x402-protocol)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](#)
 
 ## Why?
 
@@ -17,7 +17,9 @@ The MCP ecosystem has **no payment layer**. Agents can call tools, read resource
 **mcp-payments** fills this gap:
 - 🔧 **MCP-native** — pricing is part of tool discovery
 - 💸 **Multi-provider** — internal ledger, Stripe (fiat), x402 (crypto), on-chain
-- 🔗 **x402 billing middleware (NEW v0.3.0)** — enforce HTTP 402 payments on any ASGI app
+- 🛒 **Service Marketplace Registry (NEW v0.5.0)** — agents discover, purchase, and provision paid services in one flow
+- 📊 **Usage metering (v0.4.0)** — record, aggregate, and settle metered billing (per-call, per-token, per-second)
+- 🔗 **x402 billing middleware (v0.3.0)** — enforce HTTP 402 payments on any ASGI app
 - 📊 **Full lifecycle** — pricing → intent → charge → verify → refund → receipt
 - 🔒 **Escrow** — hold funds until a task between agents completes
 - ✂️ **Split payments** — distribute one charge to multiple recipients
@@ -48,7 +50,52 @@ mcp-payments x402 0.01 --resource-url https://api.example.com/premium \
   --merchant-wallet 0x123...
 ```
 
-## x402 Billing Middleware (NEW v0.3.0)
+## Service Marketplace Registry (NEW v0.5.0)
+
+The first **unified discovery + payment** layer for AI agents. Providers list services; agents search, see in-line pricing, purchase, and get provisioning credentials — all through one MCP server.
+
+This closes the loop that competitors are building piecemeal: Rail402 does discovery, piprail does x402 SDK, agent-discovery-mcp does ERC-8004. mcp-payments unifies all of it.
+
+```python
+from mcp_payments.engine import PaymentEngine
+
+engine = PaymentEngine()
+
+# 1. Provider registers a service
+svc = engine.register_service(
+    name="Web Search API",
+    slug="web-search",
+    provider_customer_id=provider.id,
+    description="Full-text web search for agents",
+    category="search",
+    tags=["search", "web", "research"],
+    price_per_call=5,  # 5 cents per query
+    free_tier_limit=10,
+    endpoint_url="https://api.example.com/v1/search",
+    mcp_server_url="https://mcp.example.com/search",
+)
+engine.publish_service(svc.id)
+
+# 2. Agent discovers via search
+results = engine.search_services("web search")
+# → Returns services with in-line pricing, ratings, endpoint info
+
+# 3. Agent purchases — discover → pay → provision in one call
+access = engine.purchase_service(svc.id, customer_id=buyer.id)
+# → {access_granted: True, endpoint_url: "...", payment_id: "pay_...", ...}
+
+# 4. Agent leaves a verified review
+engine.review_service(svc.id, customer_id=buyer.id, rating=5, comment="Fast and accurate")
+# → verified=True (auto-checked against payment history)
+
+# 5. Subscription plans
+plan = engine.create_plan(svc.id, "Pro", price_cents=1000, included_calls=1000)
+engine.subscribe_to_plan(plan.id, customer_id=buyer.id)
+```
+
+**MCP tools added (10 new):** `register_service`, `publish_service`, `search_services`, `list_services`, `get_service`, `purchase_service`, `create_plan`, `subscribe_to_plan`, `review_service`, `list_service_reviews`
+
+## x402 Billing Middleware (v0.3.0)
 
 Enforce HTTP 402 payments on any ASGI app (FastAPI, Starlette). Agents that request a paid endpoint receive a `402 Payment Required` with x402 payment requirements. When they retry with a valid `X-PAYMENT` header, the middleware verifies the payment and returns the resource.
 
@@ -207,7 +254,7 @@ mcp-payments/
 │   ├── storage.py      # JSON-backed storage (swap to SQL for production)
 │   ├── server/         # MCP server (25 tools)
 │   └── cli/            # CLI interface
-├── tests/              # Comprehensive test suite (226 tests)
+├── tests/              # Comprehensive test suite (319 tests)
 └── docs/               # Documentation
 ```
 

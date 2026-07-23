@@ -307,5 +307,78 @@ def tools():
     console.print(table)
 
 
+# ── v0.4.0: Usage Metering CLI ─────────────────────────────────────────────
+
+@cli.command(name="meter")
+@click.argument("customer_id")
+@click.argument("tool_name")
+@click.option("--unit", "-u", default="calls", type=click.Choice(["calls", "tokens", "input_tokens", "output_tokens", "seconds", "requests", "bytes", "custom"]), help="Usage unit")
+@click.option("--quantity", "-q", type=float, default=1, help="Quantity consumed")
+@click.option("--session", "-s", help="Session ID")
+@click.option("--input-tokens", type=int, help="Input/prompt tokens (for token billing)")
+@click.option("--output-tokens", type=int, help="Output/completion tokens (for token billing)")
+def meter(customer_id, tool_name, unit, quantity, session, input_tokens, output_tokens):
+    """Record a metered usage event."""
+    from ..models import UsageUnit
+
+    engine = get_engine()
+    try:
+        event = engine.record_usage(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            unit=UsageUnit(unit),
+            quantity=quantity,
+            session_id=session,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/]")
+        sys.exit(1)
+    console.print(f"[green]✓[/] Usage recorded: {event.id}")
+    console.print(f"  Tool: {tool_name} | Unit: {unit} | Quantity: {event.quantity}")
+
+
+@cli.command(name="usage")
+@click.argument("customer_id")
+@click.option("--tool", "-t", help="Filter by tool name")
+def usage(customer_id, tool):
+    """Show usage summary for a customer."""
+    engine = get_engine()
+    summary = engine.get_usage_summary(customer_id=customer_id, tool_name=tool)
+
+    console.print(f"[cyan]Usage Summary[/] for {customer_id}")
+    if tool:
+        console.print(f"  Tool filter: {tool}")
+    console.print(f"  Period: {summary.period_start.strftime('%Y-%m-%d')} → {summary.period_end.strftime('%Y-%m-%d')}")
+    console.print(f"  Total events: {summary.total_events}")
+    console.print(f"  Settled: [green]{summary.settled_events}[/] | Unsettled: [yellow]{summary.unsettled_events}[/]")
+    if summary.total_by_unit:
+        console.print("\n  [cyan]By Unit[/]")
+        for unit, qty in summary.total_by_unit.items():
+            console.print(f"    {unit}: {qty:,.0f}")
+    console.print(f"\n  Estimated cost: [green]${summary.estimated_cost:.4f}[/]")
+
+
+@cli.command(name="settle")
+@click.argument("customer_id")
+@click.option("--tool", "-t", help="Only settle a specific tool")
+def settle(customer_id, tool):
+    """Settle metered usage — charge for accumulated events."""
+    engine = get_engine()
+    result = engine.settle_usage(customer_id=customer_id, tool_name=tool)
+
+    console.print(f"[cyan]Settlement Result[/]")
+    console.print(f"  Events settled: {result.events_settled}")
+    console.print(f"  Total charged: [green]${result.total_charged:.2f}[/]")
+    if result.payment_ids:
+        console.print(f"  Payment IDs: {', '.join(result.payment_ids[:5])}")
+    if result.breakdown:
+        console.print("\n  [cyan]Breakdown[/]")
+        for tl, info in result.breakdown.items():
+            status_color = "green" if info.get("charged") else "yellow"
+            console.print(f"    {tl}: {info['events']} events → ${info['cost']:.4f} [{status_color}]{'charged' if info.get('charged') else 'no charge'}[/]")
+
+
 if __name__ == "__main__":
     cli()

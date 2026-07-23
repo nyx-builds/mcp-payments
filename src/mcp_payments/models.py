@@ -262,3 +262,156 @@ class SplitPayment(BaseModel):
     completed_at: Optional[datetime] = Field(default=None)
     settlement_payment_ids: list[str] = Field(default_factory=list, description="Payment IDs credited to each share")
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── v0.4.0: Usage Metering ─────────────────────────────────────────────────
+
+class UsageUnit(str, Enum):
+    """Units that usage can be measured in."""
+    CALLS = "calls"            # per-use / per-invocation
+    TOKENS = "tokens"          # LLM tokens (input + output)
+    INPUT_TOKENS = "input_tokens"
+    OUTPUT_TOKENS = "output_tokens"
+    SECONDS = "seconds"        # duration-based (compute time)
+    REQUESTS = "requests"      # API requests
+    BYTES = "bytes"            # data transfer
+    CUSTOM = "custom"          # user-defined unit
+
+
+class UsageEvent(BaseModel):
+    """A single metered usage event from an agent.
+
+    Recorded every time an agent calls a tool, consumes tokens, or uses
+    a metered resource. Events accumulate in a billing period and are
+    settled (charged) at period end or when explicitly triggered.
+    """
+    id: str = Field(default_factory=lambda: f"usage_{uuid.uuid4().hex[:24]}")
+    customer_id: str
+    tool_name: str
+    unit: UsageUnit = Field(default=UsageUnit.CALLS)
+    quantity: float = Field(..., ge=0, description="Amount consumed (e.g. 1500 tokens, 1 call, 30 seconds)")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    session_id: Optional[str] = Field(default=None, description="Agent session that generated this event")
+    request_id: Optional[str] = Field(default=None, description="Individual request/invocation ID")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    # Optional breakdown for token-based pricing
+    input_tokens: Optional[int] = Field(default=None, description="Input/prompt tokens (if unit=tokens)")
+    output_tokens: Optional[int] = Field(default=None, description="Output/completion tokens (if unit=tokens)")
+    settled: bool = Field(default=False, description="Whether this event has been included in a settlement charge")
+
+
+class UsageSummary(BaseModel):
+    """Aggregated usage for a customer/tool over a time window."""
+    customer_id: str
+    tool_name: Optional[str] = None
+    period_start: datetime
+    period_end: datetime
+    total_events: int = 0
+    total_by_unit: dict[str, float] = Field(default_factory=dict, description="Total quantity per unit type")
+    estimated_cost: float = Field(default=0.0, description="Estimated cost based on current pricing")
+    currency: Currency = Field(default=Currency.USD)
+    unsettled_events: int = 0
+    settled_events: int = 0
+
+
+class SettlementResult(BaseModel):
+    """Result of settling metered usage — charges applied."""
+    customer_id: str
+    tool_name: Optional[str] = None
+    period_start: datetime
+    period_end: datetime
+    events_settled: int = 0
+    total_charged: float = Field(default=0.0, ge=0)
+    currency: Currency = Field(default=Currency.USD)
+    payment_ids: list[str] = Field(default_factory=list)
+    breakdown: dict[str, Any] = Field(default_factory=dict, description="Per-tool charge breakdown")
+
+
+# ── v0.5.0: Service Marketplace Registry ────────────────────────────────────
+
+class ServiceStatus(str, Enum):
+    """Publication lifecycle of a marketplace service listing."""
+    DRAFT = "draft"            # created but not publicly visible
+    ACTIVE = "active"          # published and discoverable
+    PAUSED = "paused"          # temporarily hidden
+    DEPRECATED = "deprecated"  # still resolves but flagged
+    DELISTED = "delisted"      # removed from marketplace
+
+
+class ServiceListing(BaseModel):
+    """A service listed on the agent marketplace.
+
+    Providers publish their tools, APIs, or compute resources here.
+    Agents discover services, check pricing, and purchase access —
+    all within a single MCP payment flow.
+
+    This is the registry entry that makes tool discovery + payment
+    a unified experience: an agent searches, sees prices in-line,
+    pays, and gets provisioning credentials in one call.
+    """
+    id: str = Field(default_factory=lambda: f"svc_{uuid.uuid4().hex[:24]}")
+    name: str = Field(..., min_length=1, max_length=120, description="Human-readable service name")
+    slug: str = Field(..., min_length=1, max_length=80, description="URL-safe identifier, unique in marketplace")
+    description: str = Field(default="", max_length=2000)
+    provider_customer_id: str = Field(..., description="Customer ID of the service provider (receives payments)")
+    category: str = Field(default="general", description="e.g. 'search', 'compute', 'data', 'translation', 'vision'")
+    tags: list[str] = Field(default_factory=list, description="Searchable tags for discovery")
+    # Pricing — stored as structured data for in-line display during discovery
+    price_per_call: Optional[float] = Field(default=None, ge=0, description="USD per call/use (cents)")
+    price_per_token: Optional[float] = Field(default=None, ge=0, description="USD per 1K tokens (cents)")
+    price_per_second: Optional[float] = Field(default=None, ge=0, description="USD per second (cents)")
+    free_tier_limit: Optional[int] = Field(default=None, description="Free calls before pricing applies")
+    # Technical
+    endpoint_url: Optional[str] = Field(default=None, description="Where the service is hosted (for provisioning)")
+    mcp_server_url: Optional[str] = Field(default=None, description="MCP server URL if service is MCP-native")
+    api_schema: Optional[dict[str, Any]] = Field(default=None, description="JSON schema for service input/output")
+    # Status
+    status: ServiceStatus = Field(default=ServiceStatus.DRAFT)
+    # Metrics (updated as agents use the service)
+    total_calls: int = Field(default=0)
+    total_revenue: float = Field(default=0.0, description="Lifetime revenue in cents")
+    rating_sum: float = Field(default=0.0)
+    rating_count: int = Field(default=0)
+    # Metadata
+    version: str = Field(default="1.0.0")
+    homepage_url: Optional[str] = Field(default=None)
+    documentation_url: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SubscriptionPlan(BaseModel):
+    """A subscription tier for a marketplace service.
+
+    Services can offer flat recurring plans in addition to usage-based
+    pricing. An agent subscribes and gets included quota each period.
+    """
+    id: str = Field(default_factory=lambda: f"plan_{uuid.uuid4().hex[:24]}")
+    service_id: str = Field(..., description="Which service this plan belongs to")
+    name: str = Field(..., min_length=1, max_length=80)
+    description: str = Field(default="")
+    price_cents: int = Field(..., ge=0, description="Recurring charge in cents")
+    currency: Currency = Field(default=Currency.USD)
+    billing_interval: str = Field(default="monthly", description="'monthly', 'daily', or 'yearly'")
+    included_calls: int = Field(default=0, description="Calls included per period (0 = unlimited if price covers)")
+    included_tokens: int = Field(default=0, description="Tokens included per period")
+    # Features list for display
+    features: list[str] = Field(default_factory=list)
+    # Trial
+    trial_days: int = Field(default=0, description="Free trial period in days")
+    # Metadata
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ServiceReview(BaseModel):
+    """A review/rating left by an agent that used a service."""
+    id: str = Field(default_factory=lambda: f"rev_{uuid.uuid4().hex[:24]}")
+    service_id: str
+    customer_id: str = Field(..., description="The reviewing agent's customer ID")
+    rating: int = Field(..., ge=1, le=5, description="1-5 star rating")
+    comment: str = Field(default="", max_length=2000)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Verification: was a successful payment made by this customer?
+    verified: bool = Field(default=False, description="True if customer has a succeeded payment for this service")

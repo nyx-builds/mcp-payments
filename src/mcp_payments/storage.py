@@ -14,8 +14,12 @@ from .models import (
     PaymentIntent,
     PaymentStatus,
     Refund,
+    ServiceListing,
+    ServiceReview,
     SplitPayment,
+    SubscriptionPlan,
     ToolPricing,
+    UsageEvent,
 )
 
 
@@ -34,6 +38,10 @@ class Storage:
         self._tool_pricing: dict[str, ToolPricing] = {}
         self._escrows: dict[str, Escrow] = {}
         self._splits: dict[str, SplitPayment] = {}
+        self._usage_events: dict[str, "UsageEvent"] = {}
+        self._services: dict[str, "ServiceListing"] = {}
+        self._plans: dict[str, "SubscriptionPlan"] = {}
+        self._reviews: dict[str, "ServiceReview"] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -50,6 +58,10 @@ class Storage:
             self._tool_pricing = {t["tool_name"]: ToolPricing(**t) for t in raw.get("tool_pricing", [])}
             self._escrows = {e["id"]: Escrow(**e) for e in raw.get("escrows", [])}
             self._splits = {s["id"]: SplitPayment(**s) for s in raw.get("splits", [])}
+            self._usage_events = {u["id"]: UsageEvent(**u) for u in raw.get("usage_events", [])}
+            self._services = {s["id"]: ServiceListing(**s) for s in raw.get("services", [])}
+            self._plans = {p["id"]: SubscriptionPlan(**p) for p in raw.get("plans", [])}
+            self._reviews = {r["id"]: ServiceReview(**r) for r in raw.get("reviews", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -62,6 +74,10 @@ class Storage:
             "tool_pricing": [t.model_dump(mode="json") for t in self._tool_pricing.values()],
             "escrows": [e.model_dump(mode="json") for e in self._escrows.values()],
             "splits": [s.model_dump(mode="json") for s in self._splits.values()],
+            "usage_events": [u.model_dump(mode="json") for u in self._usage_events.values()],
+            "services": [s.model_dump(mode="json") for s in self._services.values()],
+            "plans": [p.model_dump(mode="json") for p in self._plans.values()],
+            "reviews": [r.model_dump(mode="json") for r in self._reviews.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -273,3 +289,206 @@ class Storage:
             if status:
                 results = [s for s in results if s.status.value == status]
             return results[:limit]
+
+    # ── Usage Events (v0.4.0 — Metering) ──────────────────────────────
+
+    def create_usage_event(self, event: "UsageEvent") -> "UsageEvent":
+        with self._lock:
+            self._usage_events[event.id] = event
+            self._save()
+            return event
+
+    def get_usage_event(self, event_id: str) -> Optional["UsageEvent"]:
+        with self._lock:
+            return self._usage_events.get(event_id)
+
+    def list_usage_events(
+        self,
+        customer_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        settled: Optional[bool] = None,
+        since: Optional["datetime"] = None,
+        until: Optional["datetime"] = None,
+        limit: int = 10000,
+    ) -> list["UsageEvent"]:
+        from datetime import datetime as dt
+        with self._lock:
+            results = list(self._usage_events.values())
+            if customer_id:
+                results = [e for e in results if e.customer_id == customer_id]
+            if tool_name:
+                results = [e for e in results if e.tool_name == tool_name]
+            if settled is not None:
+                results = [e for e in results if e.settled == settled]
+            if since:
+                results = [e for e in results if e.timestamp >= since]
+            if until:
+                results = [e for e in results if e.timestamp <= until]
+            results.sort(key=lambda e: e.timestamp)
+            return results[:limit]
+
+    def mark_events_settled(self, event_ids: list[str]) -> int:
+        """Mark a batch of usage events as settled. Returns count updated."""
+        with self._lock:
+            count = 0
+            for eid in event_ids:
+                ev = self._usage_events.get(eid)
+                if ev and not ev.settled:
+                    ev.settled = True
+                    count += 1
+            if count:
+                self._save()
+            return count
+
+    def delete_usage_event(self, event_id: str) -> bool:
+        with self._lock:
+            if event_id in self._usage_events:
+                del self._usage_events[event_id]
+                self._save()
+                return True
+            return False
+
+    # ── Marketplace: Service Listings (v0.5.0) ─────────────────────────
+
+    def create_service(self, service: "ServiceListing") -> "ServiceListing":
+        with self._lock:
+            self._services[service.id] = service
+            self._save()
+            return service
+
+    def get_service(self, service_id: str) -> Optional["ServiceListing"]:
+        with self._lock:
+            return self._services.get(service_id)
+
+    def get_service_by_slug(self, slug: str) -> Optional["ServiceListing"]:
+        with self._lock:
+            for s in self._services.values():
+                if s.slug == slug:
+                    return s
+            return None
+
+    def update_service(self, service_id: str, **kwargs) -> Optional["ServiceListing"]:
+        with self._lock:
+            s = self._services.get(service_id)
+            if s is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(s, k) and v is not None:
+                    setattr(s, k, v)
+            s.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return s
+
+    def list_services(
+        self,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        tag: Optional[str] = None,
+        limit: int = 100,
+    ) -> list["ServiceListing"]:
+        with self._lock:
+            results = list(self._services.values())
+            if status:
+                results = [s for s in results if s.status.value == status]
+            if category:
+                results = [s for s in results if s.category == category]
+            if provider_id:
+                results = [s for s in results if s.provider_customer_id == provider_id]
+            if tag:
+                results = [s for s in results if tag in s.tags]
+            return results[:limit]
+
+    def search_services(self, query: str, limit: int = 20) -> list["ServiceListing"]:
+        """Full-text search across name, description, tags, and category."""
+        query_lower = query.lower()
+        if not query_lower.strip():
+            return []
+        with self._lock:
+            scored: list[tuple[float, "ServiceListing"]] = []
+            for s in self._services.values():
+                if s.status.value not in ("active", "deprecated"):
+                    continue
+                score = 0.0
+                if query_lower in s.name.lower():
+                    score += 3.0
+                if query_lower in s.description.lower():
+                    score += 1.0
+                if query_lower in s.category.lower():
+                    score += 2.0
+                for t in s.tags:
+                    if query_lower in t.lower():
+                        score += 1.5
+                if score > 0:
+                    scored.append((score, s))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [s for _, s in scored[:limit]]
+
+    def delete_service(self, service_id: str) -> bool:
+        with self._lock:
+            if service_id in self._services:
+                del self._services[service_id]
+                self._save()
+                return True
+            return False
+
+    # ── Marketplace: Subscription Plans ────────────────────────────────
+
+    def create_plan(self, plan: "SubscriptionPlan") -> "SubscriptionPlan":
+        with self._lock:
+            self._plans[plan.id] = plan
+            self._save()
+            return plan
+
+    def get_plan(self, plan_id: str) -> Optional["SubscriptionPlan"]:
+        with self._lock:
+            return self._plans.get(plan_id)
+
+    def list_plans(self, service_id: Optional[str] = None) -> list["SubscriptionPlan"]:
+        with self._lock:
+            results = list(self._plans.values())
+            if service_id:
+                results = [p for p in results if p.service_id == service_id]
+            return results
+
+    def delete_plan(self, plan_id: str) -> bool:
+        with self._lock:
+            if plan_id in self._plans:
+                del self._plans[plan_id]
+                self._save()
+                return True
+            return False
+
+    # ── Marketplace: Reviews ───────────────────────────────────────────
+
+    def create_review(self, review: "ServiceReview") -> "ServiceReview":
+        with self._lock:
+            self._reviews[review.id] = review
+            self._save()
+            return review
+
+    def get_review(self, review_id: str) -> Optional["ServiceReview"]:
+        with self._lock:
+            return self._reviews.get(review_id)
+
+    def list_reviews(
+        self,
+        service_id: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list["ServiceReview"]:
+        with self._lock:
+            results = list(self._reviews.values())
+            if service_id:
+                results = [r for r in results if r.service_id == service_id]
+            if customer_id:
+                results = [r for r in results if r.customer_id == customer_id]
+            return results[:limit]
+
+    def delete_review(self, review_id: str) -> bool:
+        with self._lock:
+            if review_id in self._reviews:
+                del self._reviews[review_id]
+                self._save()
+                return True
+            return False

@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from ..engine import PaymentEngine
-from ..models import Currency, PaymentProvider, PaymentStatus, PricingModel, X402PaymentRequirements
+from ..models import Currency, PaymentProvider, PaymentStatus, PricingModel, ServiceStatus, X402PaymentRequirements
 
 
 # Tool schemas for MCP
@@ -327,6 +327,203 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["merchant_wallet", "rules"],
+        },
+    },
+    # ── v0.4.0: Usage Metering ────────────────────────────────────────
+    {
+        "name": "record_usage",
+        "description": "Record a metered usage event from an agent. Call this every time an agent invokes a tool, consumes tokens, or uses a metered resource. Events accumulate and are settled (charged) later via settle_usage. Supports per-call, per-token, per-second, and custom billing units.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string", "description": "Customer ID of the agent using the tool"},
+                "tool_name": {"type": "string", "description": "Name of the tool/resource consumed"},
+                "unit": {"type": "string", "enum": ["calls", "tokens", "input_tokens", "output_tokens", "seconds", "requests", "bytes", "custom"], "default": "calls", "description": "Unit of measurement"},
+                "quantity": {"type": "number", "description": "Amount consumed (e.g. 1 call, 1500 tokens, 30 seconds)", "default": 1},
+                "session_id": {"type": "string", "description": "Agent session that generated this event"},
+                "request_id": {"type": "string", "description": "Individual request/invocation ID"},
+                "input_tokens": {"type": "integer", "description": "Input/prompt tokens (for token-based pricing; auto-added to quantity if quantity=1)"},
+                "output_tokens": {"type": "integer", "description": "Output/completion tokens (for token-based pricing)"},
+            },
+            "required": ["customer_id", "tool_name"],
+        },
+    },
+    {
+        "name": "get_usage_summary",
+        "description": "Get aggregated usage summary for a customer, optionally filtered by tool and time period. Returns total events, breakdown by unit, estimated cost based on current pricing, and settled/unsettled counts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "tool_name": {"type": "string", "description": "Filter to a specific tool"},
+            },
+            "required": ["customer_id"],
+        },
+    },
+    {
+        "name": "settle_usage",
+        "description": "Settle accumulated metered usage — charges the customer for all unsettled events. Groups by tool, computes cost from pricing, and creates charges. Call this at the end of a billing period. Idempotent: already-settled events are skipped.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "tool_name": {"type": "string", "description": "Only settle usage for this tool (optional)"},
+            },
+            "required": ["customer_id"],
+        },
+    },
+    {
+        "name": "list_usage_events",
+        "description": "List raw usage events with optional filters. Useful for auditing or debugging metered billing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "settled": {"type": "boolean", "description": "Filter by settled status"},
+                "limit": {"type": "integer", "default": 100},
+            },
+        },
+    },
+    # ── v0.5.0: Service Marketplace Registry ────────────────────────────
+    {
+        "name": "register_service",
+        "description": "Register a service on the agent marketplace. Providers publish their tools, APIs, or compute resources. Services start as DRAFT — call publish_service to make them discoverable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Human-readable service name"},
+                "slug": {"type": "string", "description": "URL-safe unique identifier"},
+                "provider_customer_id": {"type": "string", "description": "Customer ID of the provider (receives payments)"},
+                "description": {"type": "string"},
+                "category": {"type": "string", "default": "general", "description": "e.g. search, compute, data, translation"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Searchable tags"},
+                "price_per_call": {"type": "number", "description": "USD cents per call/use"},
+                "price_per_token": {"type": "number", "description": "USD cents per 1K tokens"},
+                "price_per_second": {"type": "number", "description": "USD cents per second"},
+                "free_tier_limit": {"type": "integer", "description": "Free calls before pricing applies"},
+                "endpoint_url": {"type": "string", "description": "Where the service is hosted"},
+                "mcp_server_url": {"type": "string", "description": "MCP server URL if service is MCP-native"},
+                "api_schema": {"type": "object", "description": "JSON schema for service input/output"},
+                "status": {"type": "string", "enum": [s.value for s in ServiceStatus], "default": "draft"},
+            },
+            "required": ["name", "slug", "provider_customer_id"],
+        },
+    },
+    {
+        "name": "publish_service",
+        "description": "Publish a service — moves it from DRAFT to ACTIVE so agents can discover and purchase it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"service_id": {"type": "string"}},
+            "required": ["service_id"],
+        },
+    },
+    {
+        "name": "search_services",
+        "description": "Search the marketplace for services. Returns matching services with in-line pricing, ratings, and endpoint info. This is the discovery entry point for agents looking for paid tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query (matches name, description, tags, category)"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_services",
+        "description": "Browse marketplace services with filters. Use category or tag to explore by type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string"},
+                "tag": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+    },
+    {
+        "name": "get_service",
+        "description": "Get full details for a specific marketplace service, including pricing, endpoint, and rating.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+                "slug": {"type": "string", "description": "Alternatively, look up by slug"},
+            },
+        },
+    },
+    {
+        "name": "purchase_service",
+        "description": "Purchase access to a marketplace service. Charges the customer and returns provisioning info (endpoint URL, API schema). This is the discover → pay → provision flow in one call. If the service has a price_per_call, that amount is charged; pass amount to override.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+                "customer_id": {"type": "string", "description": "Customer ID of the purchasing agent"},
+                "amount": {"type": "number", "description": "Override charge amount (defaults to service price)"},
+                "description": {"type": "string"},
+            },
+            "required": ["service_id", "customer_id"],
+        },
+    },
+    {
+        "name": "create_plan",
+        "description": "Create a subscription plan for a marketplace service. Plans offer recurring billing with included quota.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+                "name": {"type": "string", "description": "Plan name (e.g. 'Pro', 'Starter')"},
+                "price_cents": {"type": "integer", "description": "Recurring charge in cents"},
+                "description": {"type": "string"},
+                "billing_interval": {"type": "string", "enum": ["daily", "monthly", "yearly"], "default": "monthly"},
+                "included_calls": {"type": "integer", "default": 0},
+                "included_tokens": {"type": "integer", "default": 0},
+                "features": {"type": "array", "items": {"type": "string"}},
+                "trial_days": {"type": "integer", "default": 0},
+            },
+            "required": ["service_id", "name", "price_cents"],
+        },
+    },
+    {
+        "name": "subscribe_to_plan",
+        "description": "Subscribe a customer to a subscription plan. Charges the recurring fee immediately and returns subscription details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "plan_id": {"type": "string"},
+                "customer_id": {"type": "string"},
+            },
+            "required": ["plan_id", "customer_id"],
+        },
+    },
+    {
+        "name": "review_service",
+        "description": "Leave a rating (1-5) and review for a marketplace service. Reviews are auto-verified if the reviewer has a successful payment for the service.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+                "customer_id": {"type": "string"},
+                "rating": {"type": "integer", "minimum": 1, "maximum": 5},
+                "comment": {"type": "string"},
+            },
+            "required": ["service_id", "customer_id", "rating"],
+        },
+    },
+    {
+        "name": "list_service_reviews",
+        "description": "List reviews for a marketplace service, optionally filtered by customer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+                "customer_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 50},
+            },
         },
     },
 ]
@@ -748,5 +945,285 @@ class MCPServer:
                 "    pricing_rules=pricing_rules,\n"
                 ")"
             ),
+        }
+
+    # ── v0.4.0: Usage Metering handlers ──────────────────────────────
+
+    def _tool_record_usage(self, args: dict) -> dict:
+        from ..models import UsageUnit
+
+        unit = UsageUnit(args.get("unit", "calls"))
+        event = self.engine.record_usage(
+            customer_id=args["customer_id"],
+            tool_name=args["tool_name"],
+            unit=unit,
+            quantity=args.get("quantity", 1),
+            session_id=args.get("session_id"),
+            request_id=args.get("request_id"),
+            input_tokens=args.get("input_tokens"),
+            output_tokens=args.get("output_tokens"),
+            metadata=args.get("metadata"),
+        )
+        return {
+            "event_id": event.id,
+            "customer_id": event.customer_id,
+            "tool_name": event.tool_name,
+            "unit": event.unit.value,
+            "quantity": event.quantity,
+            "settled": event.settled,
+            "timestamp": event.timestamp.isoformat(),
+        }
+
+    def _tool_get_usage_summary(self, args: dict) -> dict:
+        summary = self.engine.get_usage_summary(
+            customer_id=args["customer_id"],
+            tool_name=args.get("tool_name"),
+        )
+        return {
+            "customer_id": summary.customer_id,
+            "tool_name": summary.tool_name,
+            "period_start": summary.period_start.isoformat(),
+            "period_end": summary.period_end.isoformat(),
+            "total_events": summary.total_events,
+            "total_by_unit": summary.total_by_unit,
+            "estimated_cost": summary.estimated_cost,
+            "currency": summary.currency.value,
+            "settled_events": summary.settled_events,
+            "unsettled_events": summary.unsettled_events,
+        }
+
+    def _tool_settle_usage(self, args: dict) -> dict:
+        result = self.engine.settle_usage(
+            customer_id=args["customer_id"],
+            tool_name=args.get("tool_name"),
+        )
+        return {
+            "customer_id": result.customer_id,
+            "tool_name": result.tool_name,
+            "period_start": result.period_start.isoformat(),
+            "period_end": result.period_end.isoformat(),
+            "events_settled": result.events_settled,
+            "total_charged": result.total_charged,
+            "currency": result.currency.value,
+            "payment_ids": result.payment_ids,
+            "breakdown": result.breakdown,
+        }
+
+    def _tool_list_usage_events(self, args: dict) -> dict:
+        events = self.engine.list_usage_events(
+            customer_id=args.get("customer_id"),
+            tool_name=args.get("tool_name"),
+            settled=args.get("settled"),
+            limit=args.get("limit", 100),
+        )
+        return {
+            "count": len(events),
+            "events": [
+                {
+                    "event_id": e.id,
+                    "customer_id": e.customer_id,
+                    "tool_name": e.tool_name,
+                    "unit": e.unit.value,
+                    "quantity": e.quantity,
+                    "settled": e.settled,
+                    "session_id": e.session_id,
+                    "timestamp": e.timestamp.isoformat(),
+                }
+                for e in events
+            ],
+        }
+
+    # ── v0.5.0: Marketplace Handlers ──────────────────────────────────
+
+    def _tool_register_service(self, args: dict) -> dict:
+        status = ServiceStatus(args.get("status", "draft"))
+        service = self.engine.register_service(
+            name=args["name"],
+            slug=args["slug"],
+            provider_customer_id=args["provider_customer_id"],
+            description=args.get("description", ""),
+            category=args.get("category", "general"),
+            tags=args.get("tags", []),
+            price_per_call=args.get("price_per_call"),
+            price_per_token=args.get("price_per_token"),
+            price_per_second=args.get("price_per_second"),
+            free_tier_limit=args.get("free_tier_limit"),
+            endpoint_url=args.get("endpoint_url"),
+            mcp_server_url=args.get("mcp_server_url"),
+            api_schema=args.get("api_schema"),
+            status=status,
+        )
+        return {
+            "service_id": service.id,
+            "name": service.name,
+            "slug": service.slug,
+            "status": service.status.value,
+            "category": service.category,
+        }
+
+    def _tool_publish_service(self, args: dict) -> dict:
+        service = self.engine.publish_service(args["service_id"])
+        if service is None:
+            return {"error": "Service not found"}
+        return {
+            "service_id": service.id,
+            "name": service.name,
+            "status": service.status.value,
+            "message": f"Service '{service.name}' is now live and discoverable",
+        }
+
+    def _tool_search_services(self, args: dict) -> dict:
+        services = self.engine.search_services(
+            query=args["query"],
+            limit=args.get("limit", 20),
+        )
+        return {
+            "count": len(services),
+            "query": args["query"],
+            "services": [self._service_summary(s) for s in services],
+        }
+
+    def _tool_list_services(self, args: dict) -> dict:
+        services = self.engine.list_services(
+            category=args.get("category"),
+            tag=args.get("tag"),
+            status=args.get("status", "active"),
+            limit=args.get("limit", 50),
+        )
+        return {
+            "count": len(services),
+            "services": [self._service_summary(s) for s in services],
+        }
+
+    def _tool_get_service(self, args: dict) -> dict:
+        if args.get("service_id"):
+            service = self.engine.get_service(args["service_id"])
+        elif args.get("slug"):
+            service = self.engine.get_service_by_slug(args["slug"])
+        else:
+            return {"error": "Provide service_id or slug"}
+        if service is None:
+            return {"error": "Service not found"}
+        return self._service_detail(service)
+
+    def _tool_purchase_service(self, args: dict) -> dict:
+        result = self.engine.purchase_service(
+            service_id=args["service_id"],
+            customer_id=args["customer_id"],
+            amount=args.get("amount"),
+            description=args.get("description", ""),
+        )
+        return result
+
+    def _tool_create_plan(self, args: dict) -> dict:
+        plan = self.engine.create_plan(
+            service_id=args["service_id"],
+            name=args["name"],
+            price_cents=args["price_cents"],
+            description=args.get("description", ""),
+            billing_interval=args.get("billing_interval", "monthly"),
+            included_calls=args.get("included_calls", 0),
+            included_tokens=args.get("included_tokens", 0),
+            features=args.get("features", []),
+            trial_days=args.get("trial_days", 0),
+        )
+        return {
+            "plan_id": plan.id,
+            "service_id": plan.service_id,
+            "name": plan.name,
+            "price_cents": plan.price_cents,
+            "billing_interval": plan.billing_interval,
+        }
+
+    def _tool_subscribe_to_plan(self, args: dict) -> dict:
+        result = self.engine.subscribe_to_plan(
+            plan_id=args["plan_id"],
+            customer_id=args["customer_id"],
+        )
+        return result
+
+    def _tool_review_service(self, args: dict) -> dict:
+        review = self.engine.review_service(
+            service_id=args["service_id"],
+            customer_id=args["customer_id"],
+            rating=args["rating"],
+            comment=args.get("comment", ""),
+        )
+        return {
+            "review_id": review.id,
+            "service_id": review.service_id,
+            "rating": review.rating,
+            "verified": review.verified,
+        }
+
+    def _tool_list_service_reviews(self, args: dict) -> dict:
+        reviews = self.engine.list_reviews(
+            service_id=args.get("service_id"),
+            customer_id=args.get("customer_id"),
+            limit=args.get("limit", 50),
+        )
+        return {
+            "count": len(reviews),
+            "reviews": [
+                {
+                    "review_id": r.id,
+                    "service_id": r.service_id,
+                    "customer_id": r.customer_id,
+                    "rating": r.rating,
+                    "comment": r.comment,
+                    "verified": r.verified,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in reviews
+            ],
+        }
+
+    # ── Marketplace helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _service_summary(s) -> dict:
+        avg_rating = s.rating_sum / s.rating_count if s.rating_count > 0 else 0
+        return {
+            "service_id": s.id,
+            "name": s.name,
+            "slug": s.slug,
+            "category": s.category,
+            "description": s.description[:120],
+            "price_per_call": s.price_per_call,
+            "price_per_token": s.price_per_token,
+            "free_tier_limit": s.free_tier_limit,
+            "rating": round(avg_rating, 1),
+            "rating_count": s.rating_count,
+            "total_calls": s.total_calls,
+            "mcp_server_url": s.mcp_server_url,
+        }
+
+    @staticmethod
+    def _service_detail(s) -> dict:
+        avg_rating = s.rating_sum / s.rating_count if s.rating_count > 0 else 0
+        return {
+            "service_id": s.id,
+            "name": s.name,
+            "slug": s.slug,
+            "description": s.description,
+            "category": s.category,
+            "tags": s.tags,
+            "provider_customer_id": s.provider_customer_id,
+            "price_per_call": s.price_per_call,
+            "price_per_token": s.price_per_token,
+            "price_per_second": s.price_per_second,
+            "free_tier_limit": s.free_tier_limit,
+            "endpoint_url": s.endpoint_url,
+            "mcp_server_url": s.mcp_server_url,
+            "api_schema": s.api_schema,
+            "status": s.status.value,
+            "version": s.version,
+            "rating": round(avg_rating, 1),
+            "rating_count": s.rating_count,
+            "total_calls": s.total_calls,
+            "total_revenue": s.total_revenue,
+            "homepage_url": s.homepage_url,
+            "documentation_url": s.documentation_url,
+            "created_at": s.created_at.isoformat(),
         }
 

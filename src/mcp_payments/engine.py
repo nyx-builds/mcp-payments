@@ -6,6 +6,7 @@ import hmac
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from .models import (
@@ -22,10 +23,18 @@ from .models import (
     PricingModel,
     Refund,
     RefundStatus,
+    ServiceListing,
+    ServiceReview,
+    ServiceStatus,
+    SettlementResult,
     SplitPayment,
     SplitShare,
     SplitStatus,
+    SubscriptionPlan,
     ToolPricing,
+    UsageEvent,
+    UsageSummary,
+    UsageUnit,
     X402PaymentRequirements,
 )
 from .storage import Storage
@@ -705,3 +714,552 @@ class PaymentEngine:
     ) -> list[SplitPayment]:
         status_val = status.value if hasattr(status, "value") else status
         return self.storage.list_splits(payer_id=payer_id, status=status_val)
+
+    # ── Usage Metering (v0.4.0 — track and settle agent consumption) ──
+
+    def record_usage(
+        self,
+        customer_id: str,
+        tool_name: str,
+        unit: UsageUnit = UsageUnit.CALLS,
+        quantity: float = 1,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        metadata: dict | None = None,
+    ) -> UsageEvent:
+        """Record a metered usage event."""
+        if unit in (UsageUnit.TOKENS, UsageUnit.INPUT_TOKENS, UsageUnit.OUTPUT_TOKENS):
+            if input_tokens and output_tokens and quantity == 1:
+                quantity = input_tokens + output_tokens
+
+        if self.storage.get_customer(customer_id) is None:
+            raise ValueError(f"Customer not found: {customer_id}")
+
+        event = UsageEvent(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            unit=unit,
+            quantity=quantity,
+            session_id=session_id,
+            request_id=request_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            metadata=metadata or {},
+        )
+        return self.storage.create_usage_event(event)
+
+    def get_usage_summary(
+        self,
+        customer_id: str,
+        tool_name: str | None = None,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+    ) -> UsageSummary:
+        """Aggregate usage events into a summary with estimated cost."""
+        now = datetime.now(timezone.utc)
+        if period_start is None:
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if period_end is None:
+            period_end = now
+
+        events = self.storage.list_usage_events(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            since=period_start,
+            until=period_end,
+            limit=100000,
+        )
+
+        total_by_unit: dict[str, float] = {}
+        settled_count = 0
+        unsettled_count = 0
+
+        for ev in events:
+            unit_key = ev.unit.value
+            total_by_unit[unit_key] = total_by_unit.get(unit_key, 0) + ev.quantity
+            if ev.settled:
+                settled_count += 1
+            else:
+                unsettled_count += 1
+
+        estimated_cost = self._estimate_usage_cost(events)
+
+        return UsageSummary(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            period_start=period_start,
+            period_end=period_end,
+            total_events=len(events),
+            total_by_unit=total_by_unit,
+            estimated_cost=round(estimated_cost, 4),
+            currency=Currency.USD,
+            settled_events=settled_count,
+            unsettled_events=unsettled_count,
+        )
+
+    def _estimate_usage_cost(self, events: list[UsageEvent]) -> float:
+        """Estimate total cost for usage events based on tool pricing."""
+        total = 0.0
+        tool_totals: dict[str, dict[str, float]] = {}
+        for ev in events:
+            tool = tool_totals.setdefault(ev.tool_name, {})
+            unit = ev.unit.value
+            tool[unit] = tool.get(unit, 0) + ev.quantity
+
+        for tool_name, units in tool_totals.items():
+            pricing = self.storage.get_tool_pricing(tool_name)
+            if not pricing:
+                continue
+            amount = pricing.price.amount
+            model = pricing.price.pricing_model
+
+            for unit, qty in units.items():
+                if model == PricingModel.PER_USE and unit == UsageUnit.CALLS.value:
+                    total += qty * amount
+                elif model == PricingModel.PER_TOKEN and unit in (
+                    UsageUnit.TOKENS.value,
+                    UsageUnit.INPUT_TOKENS.value,
+                    UsageUnit.OUTPUT_TOKENS.value,
+                ):
+                    total += (qty / 1000) * amount
+                elif model == PricingModel.FIXED:
+                    total += amount
+        return total
+
+    def settle_usage(
+        self,
+        customer_id: str,
+        tool_name: str | None = None,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+    ) -> SettlementResult:
+        """Settle unsettled usage events — charge the customer for accumulated usage."""
+        now = datetime.now(timezone.utc)
+        if period_start is None:
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if period_end is None:
+            period_end = now
+
+        unsettled = self.storage.list_usage_events(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            settled=False,
+            since=period_start,
+            until=period_end,
+            limit=100000,
+        )
+
+        if not unsettled:
+            return SettlementResult(
+                customer_id=customer_id,
+                tool_name=tool_name,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+        by_tool: dict[str, list[UsageEvent]] = {}
+        for ev in unsettled:
+            by_tool.setdefault(ev.tool_name, []).append(ev)
+
+        payment_ids: list[str] = []
+        breakdown: dict[str, Any] = {}
+        total_charged = 0.0
+        events_settled = 0
+
+        for tl_name, events in by_tool.items():
+            cost = self._estimate_usage_cost(events)
+            if cost <= 0:
+                event_ids = [e.id for e in events]
+                self.storage.mark_events_settled(event_ids)
+                events_settled += len(events)
+                breakdown[tl_name] = {"events": len(events), "cost": 0, "charged": False}
+                continue
+
+            charge_amount = float(Decimal(str(cost)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            payment = self.charge(
+                customer_id=customer_id,
+                amount=charge_amount,
+                currency=Currency.USD,
+                tool_name=tl_name,
+                description=f"[METERED] {len(events)} events settled",
+                provider=PaymentProvider.INTERNAL,
+                metadata={
+                    "metered": True,
+                    "event_count": len(events),
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                },
+            )
+
+            event_ids = [e.id for e in events]
+            self.storage.mark_events_settled(event_ids)
+            events_settled += len(events)
+            total_charged += payment.amount
+
+            breakdown[tl_name] = {
+                "events": len(events),
+                "cost": round(cost, 4),
+                "charged": payment.status == PaymentStatus.SUCCEEDED,
+                "payment_id": payment.id,
+                "status": payment.status.value,
+            }
+            payment_ids.append(payment.id)
+
+        return SettlementResult(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            period_start=period_start,
+            period_end=period_end,
+            events_settled=events_settled,
+            total_charged=round(total_charged, 2),
+            currency=Currency.USD,
+            payment_ids=payment_ids,
+            breakdown=breakdown,
+        )
+
+    def list_usage_events(
+        self,
+        customer_id: str | None = None,
+        tool_name: str | None = None,
+        settled: bool | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+    ) -> list[UsageEvent]:
+        """List usage events with optional filters."""
+        return self.storage.list_usage_events(
+            customer_id=customer_id,
+            tool_name=tool_name,
+            settled=settled,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+
+    def get_usage_event(self, event_id: str) -> Optional[UsageEvent]:
+        return self.storage.get_usage_event(event_id)
+
+    # ── Marketplace: Service Registry (v0.5.0) ─────────────────────────
+    #
+    # Agents discover paid services, see in-line pricing, and purchase
+    # access — all through a single MCP server. This closes the loop:
+    # discover → price → pay → provision.
+
+    def register_service(
+        self,
+        name: str,
+        slug: str,
+        provider_customer_id: str,
+        description: str = "",
+        category: str = "general",
+        tags: list[str] | None = None,
+        price_per_call: float | None = None,
+        price_per_token: float | None = None,
+        price_per_second: float | None = None,
+        free_tier_limit: int | None = None,
+        endpoint_url: str | None = None,
+        mcp_server_url: str | None = None,
+        api_schema: dict | None = None,
+        status: ServiceStatus = ServiceStatus.DRAFT,
+        homepage_url: str | None = None,
+        documentation_url: str | None = None,
+        metadata: dict | None = None,
+    ) -> ServiceListing:
+        """Register a new service on the marketplace."""
+        # Validate slug uniqueness
+        existing = self.storage.get_service_by_slug(slug)
+        if existing:
+            raise ValueError(f"Service slug already taken: {slug}")
+
+        # Validate provider exists
+        provider = self.storage.get_customer(provider_customer_id)
+        if provider is None:
+            raise ValueError(f"Provider customer not found: {provider_customer_id}")
+
+        service = ServiceListing(
+            name=name,
+            slug=slug,
+            provider_customer_id=provider_customer_id,
+            description=description,
+            category=category,
+            tags=tags or [],
+            price_per_call=price_per_call,
+            price_per_token=price_per_token,
+            price_per_second=price_per_second,
+            free_tier_limit=free_tier_limit,
+            endpoint_url=endpoint_url,
+            mcp_server_url=mcp_server_url,
+            api_schema=api_schema,
+            status=status,
+            homepage_url=homepage_url,
+            documentation_url=documentation_url,
+            metadata=metadata or {},
+        )
+        return self.storage.create_service(service)
+
+    def get_service(self, service_id: str) -> Optional[ServiceListing]:
+        return self.storage.get_service(service_id)
+
+    def get_service_by_slug(self, slug: str) -> Optional[ServiceListing]:
+        return self.storage.get_service_by_slug(slug)
+
+    def update_service(self, service_id: str, **kwargs) -> Optional[ServiceListing]:
+        return self.storage.update_service(service_id, **kwargs)
+
+    def publish_service(self, service_id: str) -> Optional[ServiceListing]:
+        """Move a service from DRAFT to ACTIVE — makes it discoverable."""
+        return self.storage.update_service(service_id, status=ServiceStatus.ACTIVE)
+
+    def list_services(
+        self,
+        status: str | None = None,
+        category: str | None = None,
+        provider_id: str | None = None,
+        tag: str | None = None,
+        limit: int = 100,
+    ) -> list[ServiceListing]:
+        return self.storage.list_services(
+            status=status,
+            category=category,
+            provider_id=provider_id,
+            tag=tag,
+            limit=limit,
+        )
+
+    def search_services(self, query: str, limit: int = 20) -> list[ServiceListing]:
+        """Search the marketplace for services matching a query."""
+        return self.storage.search_services(query, limit=limit)
+
+    def delete_service(self, service_id: str) -> bool:
+        return self.storage.delete_service(service_id)
+
+    def purchase_service(
+        self,
+        service_id: str,
+        customer_id: str,
+        amount: float | None = None,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Purchase access to a marketplace service.
+
+        This is the discover → pay → provision flow in a single call.
+        Charges the customer and returns service access details.
+
+        If amount is None, uses the service's price_per_call.
+        Returns the payment result + provisioning info (endpoint, schema).
+        """
+        service = self.storage.get_service(service_id)
+        if service is None:
+            raise ValueError(f"Service not found: {service_id}")
+
+        if service.status.value not in ("active", "deprecated"):
+            raise ValueError(f"Service is not available (status: {service.status.value})")
+
+        # Determine charge amount
+        if amount is None:
+            amount = service.price_per_call or 0
+
+        if amount > 0:
+            payment = self.charge(
+                customer_id=customer_id,
+                amount=amount,
+                currency=Currency.USD,
+                tool_name=service.slug,
+                description=description or f"[MARKETPLACE] {service.name}",
+                provider=PaymentProvider.INTERNAL,
+                metadata={"service_id": service_id, "marketplace": True},
+            )
+        else:
+            # Free service or free tier
+            payment = Payment(
+                customer_id=customer_id,
+                amount=0,
+                currency=Currency.USD,
+                status=PaymentStatus.SUCCEEDED,
+                provider=PaymentProvider.INTERNAL,
+                tool_name=service.slug,
+                description=f"[MARKETPLACE-FREE] {service.name}",
+                completed_at=datetime.now(timezone.utc),
+            )
+            self.storage.create_payment(payment)
+
+        # Update service metrics
+        self.storage.update_service(
+            service_id,
+            total_calls=service.total_calls + 1,
+            total_revenue=service.total_revenue + amount,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        # Also register the tool pricing so metering works
+        if service.price_per_call and not self.storage.get_tool_pricing(service.slug):
+            self.set_price(
+                tool_name=service.slug,
+                amount=service.price_per_call,
+                pricing_model=PricingModel.PER_USE,
+                free_tier_limit=service.free_tier_limit,
+            )
+
+        return {
+            "service_id": service.id,
+            "service_name": service.name,
+            "payment_id": payment.id,
+            "payment_status": payment.status.value,
+            "amount_charged": payment.amount,
+            "endpoint_url": service.endpoint_url,
+            "mcp_server_url": service.mcp_server_url,
+            "api_schema": service.api_schema,
+            "access_granted": payment.status == PaymentStatus.SUCCEEDED,
+        }
+
+    # ── Marketplace: Subscription Plans ────────────────────────────────
+
+    def create_plan(
+        self,
+        service_id: str,
+        name: str,
+        price_cents: int,
+        description: str = "",
+        billing_interval: str = "monthly",
+        included_calls: int = 0,
+        included_tokens: int = 0,
+        features: list[str] | None = None,
+        trial_days: int = 0,
+        metadata: dict | None = None,
+    ) -> SubscriptionPlan:
+        """Create a subscription plan for a marketplace service."""
+        service = self.storage.get_service(service_id)
+        if service is None:
+            raise ValueError(f"Service not found: {service_id}")
+
+        plan = SubscriptionPlan(
+            service_id=service_id,
+            name=name,
+            price_cents=price_cents,
+            description=description,
+            billing_interval=billing_interval,
+            included_calls=included_calls,
+            included_tokens=included_tokens,
+            features=features or [],
+            trial_days=trial_days,
+            metadata=metadata or {},
+        )
+        return self.storage.create_plan(plan)
+
+    def get_plan(self, plan_id: str) -> Optional[SubscriptionPlan]:
+        return self.storage.get_plan(plan_id)
+
+    def list_plans(self, service_id: str | None = None) -> list[SubscriptionPlan]:
+        return self.storage.list_plans(service_id=service_id)
+
+    def subscribe_to_plan(
+        self,
+        plan_id: str,
+        customer_id: str,
+    ) -> dict[str, Any]:
+        """Subscribe a customer to a plan — charges the recurring fee immediately."""
+        plan = self.storage.get_plan(plan_id)
+        if plan is None:
+            raise ValueError(f"Plan not found: {plan_id}")
+
+        service = self.storage.get_service(plan.service_id)
+        if service is None:
+            raise ValueError("Service for this plan no longer exists")
+
+        if plan.price_cents > 0:
+            payment = self.charge(
+                customer_id=customer_id,
+                amount=plan.price_cents,
+                currency=Currency.USD,
+                tool_name=f"{service.slug}:plan:{plan.name}",
+                description=f"[SUBSCRIPTION] {plan.name} for {service.name} ({plan.billing_interval})",
+                provider=PaymentProvider.INTERNAL,
+                metadata={"plan_id": plan_id, "service_id": plan.service_id},
+            )
+        else:
+            payment = Payment(
+                customer_id=customer_id,
+                amount=0,
+                currency=Currency.USD,
+                status=PaymentStatus.SUCCEEDED,
+                provider=PaymentProvider.INTERNAL,
+                tool_name=f"{service.slug}:plan:{plan.name}",
+                description=f"[SUBSCRIPTION-FREE] {plan.name}",
+                completed_at=datetime.now(timezone.utc),
+            )
+            self.storage.create_payment(payment)
+
+        return {
+            "plan_id": plan.id,
+            "plan_name": plan.name,
+            "service_name": service.name,
+            "payment_id": payment.id,
+            "payment_status": payment.status.value,
+            "amount_charged": payment.amount,
+            "billing_interval": plan.billing_interval,
+            "included_calls": plan.included_calls,
+            "included_tokens": plan.included_tokens,
+            "trial_days": plan.trial_days,
+            "subscribed": payment.status == PaymentStatus.SUCCEEDED,
+        }
+
+    # ── Marketplace: Reviews ───────────────────────────────────────────
+
+    def review_service(
+        self,
+        service_id: str,
+        customer_id: str,
+        rating: int,
+        comment: str = "",
+    ) -> ServiceReview:
+        """Leave a review for a marketplace service.
+
+        Reviews are automatically verified if the customer has a
+        successful payment for the service — builds trust.
+        """
+        service = self.storage.get_service(service_id)
+        if service is None:
+            raise ValueError(f"Service not found: {service_id}")
+
+        if not 1 <= rating <= 5:
+            raise ValueError("Rating must be between 1 and 5")
+
+        # Check if customer has a verified purchase
+        payments = self.storage.list_payments(customer_id=customer_id, limit=10000)
+        verified = any(
+            p.tool_name == service.slug
+            and p.status == PaymentStatus.SUCCEEDED
+            for p in payments
+        )
+
+        review = ServiceReview(
+            service_id=service_id,
+            customer_id=customer_id,
+            rating=rating,
+            comment=comment,
+            verified=verified,
+        )
+        self.storage.create_review(review)
+
+        # Update service aggregate rating
+        self.storage.update_service(
+            service_id,
+            rating_sum=service.rating_sum + rating,
+            rating_count=service.rating_count + 1,
+        )
+
+        return review
+
+    def list_reviews(
+        self,
+        service_id: str | None = None,
+        customer_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ServiceReview]:
+        return self.storage.list_reviews(
+            service_id=service_id,
+            customer_id=customer_id,
+            limit=limit,
+        )
