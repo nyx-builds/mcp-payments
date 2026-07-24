@@ -415,3 +415,94 @@ class ServiceReview(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # Verification: was a successful payment made by this customer?
     verified: bool = Field(default=False, description="True if customer has a succeeded payment for this service")
+
+
+# ── v0.6.0: Agent Spend Controls (budgets, limits, pre-auth) ──────────────
+
+class SpendWindow(str, Enum):
+    """Time window for a spend limit."""
+    PER_TRANSACTION = "per_transaction"
+    HOURLY = "hourly"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
+class SpendPolicy(BaseModel):
+    """A spend policy that controls how much an agent can spend.
+
+    Prevents runaway agents from draining budgets. Policies can limit:
+    - Per-transaction amount (block charges above a threshold)
+    - Rolling window totals (daily/weekly/monthly caps)
+    - Tool-level restrictions (allow/deny specific tools)
+    - Required pre-authorization (hold funds before a charge)
+
+    Policies are scoped per customer. Multiple policies per customer are
+    supported — the most restrictive applicable policy wins.
+    """
+    id: str = Field(default_factory=lambda: f"pol_{uuid.uuid4().hex[:24]}")
+    customer_id: str = Field(..., description="Customer this policy applies to")
+    name: str = Field(default="default", description="Human-readable policy name")
+    # Limits
+    max_per_transaction: Optional[float] = Field(default=None, ge=0, description="Max amount per single charge (cents)")
+    daily_limit: Optional[float] = Field(default=None, ge=0, description="Max total spend per day (cents)")
+    weekly_limit: Optional[float] = Field(default=None, ge=0, description="Max total spend per week (cents)")
+    monthly_limit: Optional[float] = Field(default=None, ge=0, description="Max total spend per month (cents)")
+    # Tool restrictions
+    allowed_tools: Optional[list[str]] = Field(default=None, description="Whitelist of tools the agent can pay for (None = all allowed)")
+    blocked_tools: list[str] = Field(default_factory=list, description="Blacklist of tools the agent cannot pay for")
+    # Rate limiting
+    max_transactions_per_hour: Optional[int] = Field(default=None, ge=0, description="Max number of charges per hour")
+    # State
+    enabled: bool = Field(default=True)
+    # Metadata
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuthorizationStatus(str, Enum):
+    """Result of a spend authorization check."""
+    APPROVED = "approved"
+    DENIED_POLICY_DISABLED = "denied_policy_disabled"
+    DENIED_OVER_PER_TRANSACTION = "denied_over_per_transaction"
+    DENIED_OVER_DAILY_LIMIT = "denied_over_daily_limit"
+    DENIED_OVER_WEEKLY_LIMIT = "denied_over_weekly_limit"
+    DENIED_OVER_MONTHLY_LIMIT = "denied_over_monthly_limit"
+    DENIED_TOOL_BLOCKED = "denied_tool_blocked"
+    DENIED_TOOL_NOT_ALLOWED = "denied_tool_not_allowed"
+    DENIED_INSUFFICIENT_BALANCE = "denied_insufficient_balance"
+    DENIED_RATE_LIMITED = "denied_rate_limited"
+
+
+class AuthorizationResult(BaseModel):
+    """Result of checking whether a charge is allowed under spend policies."""
+    authorized: bool
+    status: AuthorizationStatus
+    amount: float
+    customer_id: str
+    tool_name: Optional[str] = None
+    policy_id: Optional[str] = None
+    reason: str = Field(default="")
+    # Current spend context (for transparency)
+    daily_spend: float = Field(default=0.0)
+    daily_limit: Optional[float] = None
+    monthly_spend: float = Field(default=0.0)
+    monthly_limit: Optional[float] = None
+    checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SpendReport(BaseModel):
+    """Aggregated spend report for a customer over a time period."""
+    customer_id: str
+    period_start: datetime
+    period_end: datetime
+    total_spend: float = Field(default=0.0, description="Total succeeded charges in cents")
+    total_transactions: int = 0
+    total_refunded: float = Field(default=0.0)
+    net_spend: float = Field(default=0.0)
+    by_tool: dict[str, float] = Field(default_factory=dict, description="Spend per tool name")
+    by_day: dict[str, float] = Field(default_factory=dict, description="Spend per date (ISO date string)")
+    average_transaction: float = Field(default=0.0)
+    largest_transaction: float = Field(default=0.0)
+    policies_applied: list[str] = Field(default_factory=list, description="Policy IDs that affected this customer")

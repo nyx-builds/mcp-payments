@@ -17,6 +17,7 @@ from .models import (
     ServiceListing,
     ServiceReview,
     SplitPayment,
+    SpendPolicy,
     SubscriptionPlan,
     ToolPricing,
     UsageEvent,
@@ -42,6 +43,7 @@ class Storage:
         self._services: dict[str, "ServiceListing"] = {}
         self._plans: dict[str, "SubscriptionPlan"] = {}
         self._reviews: dict[str, "ServiceReview"] = {}
+        self._spend_policies: dict[str, "SpendPolicy"] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -62,6 +64,7 @@ class Storage:
             self._services = {s["id"]: ServiceListing(**s) for s in raw.get("services", [])}
             self._plans = {p["id"]: SubscriptionPlan(**p) for p in raw.get("plans", [])}
             self._reviews = {r["id"]: ServiceReview(**r) for r in raw.get("reviews", [])}
+            self._spend_policies = {p["id"]: SpendPolicy(**p) for p in raw.get("spend_policies", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -78,6 +81,7 @@ class Storage:
             "services": [s.model_dump(mode="json") for s in self._services.values()],
             "plans": [p.model_dump(mode="json") for p in self._plans.values()],
             "reviews": [r.model_dump(mode="json") for r in self._reviews.values()],
+            "spend_policies": [p.model_dump(mode="json") for p in self._spend_policies.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -492,3 +496,48 @@ class Storage:
                 self._save()
                 return True
             return False
+
+    # ── Spend Policies (v0.6.0 — Agent Spend Controls) ────────────────
+
+    def create_spend_policy(self, policy: "SpendPolicy") -> "SpendPolicy":
+        with self._lock:
+            self._spend_policies[policy.id] = policy
+            self._save()
+            return policy
+
+    def get_spend_policy(self, policy_id: str) -> Optional["SpendPolicy"]:
+        with self._lock:
+            return self._spend_policies.get(policy_id)
+
+    def update_spend_policy(self, policy_id: str, **kwargs) -> Optional["SpendPolicy"]:
+        with self._lock:
+            p = self._spend_policies.get(policy_id)
+            if p is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(p, k) and v is not None:
+                    setattr(p, k, v)
+            p.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return p
+
+    def delete_spend_policy(self, policy_id: str) -> bool:
+        with self._lock:
+            if policy_id in self._spend_policies:
+                del self._spend_policies[policy_id]
+                self._save()
+                return True
+            return False
+
+    def list_spend_policies(
+        self,
+        customer_id: Optional[str] = None,
+        enabled: Optional[bool] = None,
+    ) -> list["SpendPolicy"]:
+        with self._lock:
+            results = list(self._spend_policies.values())
+            if customer_id:
+                results = [p for p in results if p.customer_id == customer_id]
+            if enabled is not None:
+                results = [p for p in results if p.enabled == enabled]
+            return results

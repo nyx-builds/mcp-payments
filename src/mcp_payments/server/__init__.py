@@ -526,6 +526,73 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ── v0.6.0: Agent Spend Controls ───────────────────────────────────
+    {
+        "name": "set_spend_policy",
+        "description": "Set a spend policy to control how much an agent can spend. Prevents runaway agents from draining budgets. Supports per-transaction caps, daily/weekly/monthly limits, tool allow/deny lists, and rate limiting. The charge() method automatically enforces all active policies.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string", "description": "Customer ID of the agent to limit"},
+                "name": {"type": "string", "default": "default", "description": "Policy name (update existing by name)"},
+                "max_per_transaction": {"type": "number", "description": "Max amount per single charge (cents)"},
+                "daily_limit": {"type": "number", "description": "Max total spend per day (cents)"},
+                "weekly_limit": {"type": "number", "description": "Max total spend per week (cents)"},
+                "monthly_limit": {"type": "number", "description": "Max total spend per month (cents)"},
+                "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Whitelist of tools the agent can pay for"},
+                "blocked_tools": {"type": "array", "items": {"type": "string"}, "description": "Blacklist of tools the agent cannot pay for"},
+                "max_transactions_per_hour": {"type": "integer", "description": "Max number of charges per hour"},
+                "enabled": {"type": "boolean", "default": True},
+            },
+            "required": ["customer_id"],
+        },
+    },
+    {
+        "name": "check_authorization",
+        "description": "Pre-check whether a charge would be authorized under the customer's spend policies. Call this before charging to see if a payment would be blocked. Returns approval status with the reason if denied.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "amount": {"type": "number", "description": "Amount to check (cents)"},
+                "tool_name": {"type": "string"},
+            },
+            "required": ["customer_id", "amount"],
+        },
+    },
+    {
+        "name": "get_spend_report",
+        "description": "Generate a detailed spend report for a customer. Shows total spend, breakdown by tool and by day, average/largest transactions, and net spend after refunds. Useful for budget monitoring and cost analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+            },
+            "required": ["customer_id"],
+        },
+    },
+    {
+        "name": "list_spend_policies",
+        "description": "List all spend policies, optionally filtered by customer or enabled status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "delete_spend_policy",
+        "description": "Delete a spend policy by ID. Removes the spending limit or restriction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "policy_id": {"type": "string"},
+            },
+            "required": ["policy_id"],
+        },
+    },
 ]
 
 
@@ -1225,5 +1292,105 @@ class MCPServer:
             "homepage_url": s.homepage_url,
             "documentation_url": s.documentation_url,
             "created_at": s.created_at.isoformat(),
+        }
+
+    # ── v0.6.0: Spend Controls Handlers ───────────────────────────────
+
+    def _tool_set_spend_policy(self, args: dict) -> dict:
+        policy = self.engine.set_spend_policy(
+            customer_id=args["customer_id"],
+            name=args.get("name", "default"),
+            max_per_transaction=args.get("max_per_transaction"),
+            daily_limit=args.get("daily_limit"),
+            weekly_limit=args.get("weekly_limit"),
+            monthly_limit=args.get("monthly_limit"),
+            allowed_tools=args.get("allowed_tools"),
+            blocked_tools=args.get("blocked_tools"),
+            max_transactions_per_hour=args.get("max_transactions_per_hour"),
+            enabled=args.get("enabled", True),
+        )
+        return {
+            "policy_id": policy.id,
+            "customer_id": policy.customer_id,
+            "name": policy.name,
+            "max_per_transaction": policy.max_per_transaction,
+            "daily_limit": policy.daily_limit,
+            "weekly_limit": policy.weekly_limit,
+            "monthly_limit": policy.monthly_limit,
+            "allowed_tools": policy.allowed_tools,
+            "blocked_tools": policy.blocked_tools,
+            "max_transactions_per_hour": policy.max_transactions_per_hour,
+            "enabled": policy.enabled,
+        }
+
+    def _tool_check_authorization(self, args: dict) -> dict:
+        result = self.engine.check_authorization(
+            customer_id=args["customer_id"],
+            amount=args["amount"],
+            tool_name=args.get("tool_name"),
+        )
+        return {
+            "authorized": result.authorized,
+            "status": result.status.value,
+            "amount": result.amount,
+            "customer_id": result.customer_id,
+            "tool_name": result.tool_name,
+            "policy_id": result.policy_id,
+            "reason": result.reason,
+            "daily_spend": result.daily_spend,
+            "daily_limit": result.daily_limit,
+            "monthly_spend": result.monthly_spend,
+            "monthly_limit": result.monthly_limit,
+        }
+
+    def _tool_get_spend_report(self, args: dict) -> dict:
+        report = self.engine.get_spend_report(
+            customer_id=args["customer_id"],
+        )
+        return {
+            "customer_id": report.customer_id,
+            "period_start": report.period_start.isoformat(),
+            "period_end": report.period_end.isoformat(),
+            "total_spend": report.total_spend,
+            "total_transactions": report.total_transactions,
+            "total_refunded": report.total_refunded,
+            "net_spend": report.net_spend,
+            "by_tool": report.by_tool,
+            "by_day": report.by_day,
+            "average_transaction": report.average_transaction,
+            "largest_transaction": report.largest_transaction,
+            "active_policies": len(report.policies_applied),
+        }
+
+    def _tool_list_spend_policies(self, args: dict) -> dict:
+        policies = self.engine.list_spend_policies(
+            customer_id=args.get("customer_id"),
+            enabled=args.get("enabled"),
+        )
+        return {
+            "count": len(policies),
+            "policies": [
+                {
+                    "policy_id": p.id,
+                    "customer_id": p.customer_id,
+                    "name": p.name,
+                    "max_per_transaction": p.max_per_transaction,
+                    "daily_limit": p.daily_limit,
+                    "weekly_limit": p.weekly_limit,
+                    "monthly_limit": p.monthly_limit,
+                    "allowed_tools": p.allowed_tools,
+                    "blocked_tools": p.blocked_tools,
+                    "max_transactions_per_hour": p.max_transactions_per_hour,
+                    "enabled": p.enabled,
+                }
+                for p in policies
+            ],
+        }
+
+    def _tool_delete_spend_policy(self, args: dict) -> dict:
+        deleted = self.engine.delete_spend_policy(args["policy_id"])
+        return {
+            "policy_id": args["policy_id"],
+            "deleted": deleted,
         }
 

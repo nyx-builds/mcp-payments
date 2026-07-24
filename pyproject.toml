@@ -1,7 +1,7 @@
 [project]
 name = "mcp-payments"
-version = "0.5.0"
-description = "Payment execution layer for AI agents. MCP server + CLI. Charge, refund, escrow, split payments, metered billing, x402 enforcement for autonomous agents."
+version = "0.6.0"
+description = "Payment execution layer for AI agents. MCP server + CLI. Charge, refund, escrow, split payments, metered billing, x402 enforcement, spend controls for autonomous agents."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

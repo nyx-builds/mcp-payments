@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 39
+        assert len(TOOL_DEFINITIONS) == 44
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -58,6 +58,9 @@ class TestToolDefinitions:
             "list_services", "get_service", "purchase_service",
             "create_plan", "subscribe_to_plan",
             "review_service", "list_service_reviews",
+            # v0.6.0
+            "set_spend_policy", "check_authorization", "get_spend_report",
+            "list_spend_policies", "delete_spend_policy",
         }
         assert names == expected
 
@@ -65,7 +68,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 39
+        assert len(tools) == 44
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()

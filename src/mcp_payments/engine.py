@@ -10,6 +10,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from .models import (
+    AuthorizationResult,
+    AuthorizationStatus,
     Currency,
     Customer,
     Escrow,
@@ -27,6 +29,8 @@ from .models import (
     ServiceReview,
     ServiceStatus,
     SettlementResult,
+    SpendPolicy,
+    SpendReport,
     SplitPayment,
     SplitShare,
     SplitStatus,
@@ -180,6 +184,25 @@ class PaymentEngine:
         customer = self.storage.get_customer(customer_id)
         if customer is None:
             raise ValueError(f"Customer not found: {customer_id}")
+
+        # ── v0.6.0: Check spend policies before charging ──
+        auth = self.check_authorization(
+            customer_id=customer_id,
+            amount=amount,
+            tool_name=tool_name,
+        )
+        if not auth.authorized:
+            return self.storage.create_payment(Payment(
+                customer_id=customer_id,
+                amount=amount,
+                currency=currency,
+                status=PaymentStatus.FAILED,
+                provider=provider,
+                tool_name=tool_name,
+                description=f"[SPEND DENIED] {description}",
+                failure_reason=auth.reason,
+                metadata={**(metadata or {}), "authorization_status": auth.status.value},
+            ))
 
         # Check pricing / free tier
         if tool_name:
@@ -1262,4 +1285,331 @@ class PaymentEngine:
             service_id=service_id,
             customer_id=customer_id,
             limit=limit,
+        )
+
+    # ── Spend Controls (v0.6.0 — budgets, limits, pre-auth) ──────────
+    #
+    # Prevents runaway agents. Set policies per customer with per-transaction,
+    # daily/weekly/monthly caps, and tool allow/deny lists. The charge() method
+    # automatically checks all applicable policies before executing.
+
+    def set_spend_policy(
+        self,
+        customer_id: str,
+        name: str = "default",
+        max_per_transaction: float | None = None,
+        daily_limit: float | None = None,
+        weekly_limit: float | None = None,
+        monthly_limit: float | None = None,
+        allowed_tools: list[str] | None = None,
+        blocked_tools: list[str] | None = None,
+        max_transactions_per_hour: int | None = None,
+        enabled: bool = True,
+        metadata: dict | None = None,
+    ) -> SpendPolicy:
+        """Create or update a spend policy for a customer.
+
+        If a policy with the same customer_id + name exists, it's updated.
+        Otherwise a new policy is created.
+        """
+        if self.storage.get_customer(customer_id) is None:
+            raise ValueError(f"Customer not found: {customer_id}")
+
+        # Check if a policy with this name already exists for this customer
+        existing = [
+            p for p in self.storage.list_spend_policies(customer_id=customer_id)
+            if p.name == name
+        ]
+
+        if existing:
+            # Update the existing policy
+            policy = existing[0]
+            updates = {}
+            if max_per_transaction is not None:
+                updates["max_per_transaction"] = max_per_transaction
+            if daily_limit is not None:
+                updates["daily_limit"] = daily_limit
+            if weekly_limit is not None:
+                updates["weekly_limit"] = weekly_limit
+            if monthly_limit is not None:
+                updates["monthly_limit"] = monthly_limit
+            if allowed_tools is not None:
+                updates["allowed_tools"] = allowed_tools
+            if blocked_tools is not None:
+                updates["blocked_tools"] = blocked_tools
+            if max_transactions_per_hour is not None:
+                updates["max_transactions_per_hour"] = max_transactions_per_hour
+            updates["enabled"] = enabled
+            if metadata:
+                updates["metadata"] = {**policy.metadata, **metadata}
+            updated = self.storage.update_spend_policy(policy.id, **updates)
+            return updated if updated is not None else policy
+
+        policy = SpendPolicy(
+            customer_id=customer_id,
+            name=name,
+            max_per_transaction=max_per_transaction,
+            daily_limit=daily_limit,
+            weekly_limit=weekly_limit,
+            monthly_limit=monthly_limit,
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools or [],
+            max_transactions_per_hour=max_transactions_per_hour,
+            enabled=enabled,
+            metadata=metadata or {},
+        )
+        return self.storage.create_spend_policy(policy)
+
+    def get_spend_policy(self, policy_id: str) -> Optional[SpendPolicy]:
+        return self.storage.get_spend_policy(policy_id)
+
+    def list_spend_policies(
+        self,
+        customer_id: str | None = None,
+        enabled: bool | None = None,
+    ) -> list[SpendPolicy]:
+        return self.storage.list_spend_policies(
+            customer_id=customer_id,
+            enabled=enabled,
+        )
+
+    def delete_spend_policy(self, policy_id: str) -> bool:
+        return self.storage.delete_spend_policy(policy_id)
+
+    def check_authorization(
+        self,
+        customer_id: str,
+        amount: float,
+        tool_name: str | None = None,
+    ) -> AuthorizationResult:
+        """Check if a charge is authorized under the customer's spend policies.
+
+        Evaluates ALL active policies for the customer. If any policy denies
+        the charge, the charge is denied (most restrictive wins).
+        """
+        policies = self.storage.list_spend_policies(
+            customer_id=customer_id,
+            enabled=True,
+        )
+
+        # If no policies, charge is allowed by default
+        if not policies:
+            return AuthorizationResult(
+                authorized=True,
+                status=AuthorizationStatus.APPROVED,
+                amount=amount,
+                customer_id=customer_id,
+                tool_name=tool_name,
+            )
+
+        now = datetime.now(timezone.utc)
+
+        # Calculate current spend for each window
+        daily_spend = self._calculate_window_spend(customer_id, now - timedelta(days=1), now)
+        weekly_spend = self._calculate_window_spend(customer_id, now - timedelta(weeks=1), now)
+        monthly_spend = self._calculate_window_spend(customer_id, now - timedelta(days=30), now)
+        hourly_txns = len([
+            p for p in self.storage.list_payments(customer_id=customer_id, limit=10000)
+            if p.created_at >= now - timedelta(hours=1) and p.status != PaymentStatus.FAILED
+        ])
+
+        # Check each policy — most restrictive wins
+        for policy in policies:
+            # Per-transaction limit
+            if policy.max_per_transaction is not None and amount > policy.max_per_transaction:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_OVER_PER_TRANSACTION,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Amount {amount} exceeds per-transaction limit {policy.max_per_transaction}",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Daily limit
+            if policy.daily_limit is not None and daily_spend + amount > policy.daily_limit:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_OVER_DAILY_LIMIT,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Daily spend {daily_spend:.2f} + {amount} would exceed daily limit {policy.daily_limit}",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Weekly limit
+            if policy.weekly_limit is not None and weekly_spend + amount > policy.weekly_limit:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_OVER_WEEKLY_LIMIT,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Weekly spend {weekly_spend:.2f} + {amount} would exceed weekly limit {policy.weekly_limit}",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Monthly limit
+            if policy.monthly_limit is not None and monthly_spend + amount > policy.monthly_limit:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_OVER_MONTHLY_LIMIT,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Monthly spend {monthly_spend:.2f} + {amount} would exceed monthly limit {policy.monthly_limit}",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Blocked tools
+            if tool_name and policy.blocked_tools and tool_name in policy.blocked_tools:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_TOOL_BLOCKED,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Tool '{tool_name}' is blocked by spend policy",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Allowed tools (whitelist)
+            if tool_name and policy.allowed_tools is not None and tool_name not in policy.allowed_tools:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_TOOL_NOT_ALLOWED,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Tool '{tool_name}' is not in the allowed tools list",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+            # Rate limiting
+            if policy.max_transactions_per_hour is not None and hourly_txns >= policy.max_transactions_per_hour:
+                return AuthorizationResult(
+                    authorized=False,
+                    status=AuthorizationStatus.DENIED_RATE_LIMITED,
+                    amount=amount,
+                    customer_id=customer_id,
+                    tool_name=tool_name,
+                    policy_id=policy.id,
+                    reason=f"Rate limit: {hourly_txns} transactions in last hour (max {policy.max_transactions_per_hour})",
+                    daily_spend=daily_spend,
+                    daily_limit=policy.daily_limit,
+                    monthly_spend=monthly_spend,
+                    monthly_limit=policy.monthly_limit,
+                )
+
+        # All policies passed
+        return AuthorizationResult(
+            authorized=True,
+            status=AuthorizationStatus.APPROVED,
+            amount=amount,
+            customer_id=customer_id,
+            tool_name=tool_name,
+            policy_id=policies[0].id if policies else None,
+            daily_spend=daily_spend,
+            daily_limit=min((p.daily_limit for p in policies if p.daily_limit is not None), default=None),
+            monthly_spend=monthly_spend,
+            monthly_limit=min((p.monthly_limit for p in policies if p.monthly_limit is not None), default=None),
+        )
+
+    def _calculate_window_spend(
+        self,
+        customer_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> float:
+        """Calculate total succeeded spend in a time window."""
+        payments = self.storage.list_payments(customer_id=customer_id, limit=10000)
+        total = sum(
+            p.amount for p in payments
+            if p.status == PaymentStatus.SUCCEEDED
+            and p.created_at >= start
+            and p.created_at <= end
+        )
+        return round(total, 2)
+
+    def get_spend_report(
+        self,
+        customer_id: str,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+    ) -> SpendReport:
+        """Generate a detailed spend report for a customer.
+
+        Shows total spend, breakdown by tool and by day, average/largest
+        transactions, and which policies apply.
+        """
+        now = datetime.now(timezone.utc)
+        if period_start is None:
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if period_end is None:
+            period_end = now
+
+        payments = self.storage.list_payments(customer_id=customer_id, limit=10000)
+        succeeded = [
+            p for p in payments
+            if p.status == PaymentStatus.SUCCEEDED
+            and p.created_at >= period_start
+            and p.created_at <= period_end
+        ]
+        refunded = sum(p.refund_amount for p in payments if p.created_at >= period_start and p.created_at <= period_end)
+
+        total_spend = sum(p.amount for p in succeeded)
+        by_tool: dict[str, float] = {}
+        by_day: dict[str, float] = {}
+        largest = 0.0
+
+        for p in succeeded:
+            tool = p.tool_name or "unattributed"
+            by_tool[tool] = by_tool.get(tool, 0) + p.amount
+            day_key = p.created_at.strftime("%Y-%m-%d")
+            by_day[day_key] = by_day.get(day_key, 0) + p.amount
+            if p.amount > largest:
+                largest = p.amount
+
+        avg = total_spend / len(succeeded) if succeeded else 0.0
+        policies = self.storage.list_spend_policies(customer_id=customer_id)
+
+        return SpendReport(
+            customer_id=customer_id,
+            period_start=period_start,
+            period_end=period_end,
+            total_spend=round(total_spend, 2),
+            total_transactions=len(succeeded),
+            total_refunded=round(refunded, 2),
+            net_spend=round(total_spend - refunded, 2),
+            by_tool={k: round(v, 2) for k, v in sorted(by_tool.items(), key=lambda x: -x[1])},
+            by_day={k: round(v, 2) for k, v in sorted(by_day.items())},
+            average_transaction=round(avg, 2),
+            largest_transaction=round(largest, 2),
+            policies_applied=[p.id for p in policies if p.enabled],
         )
