@@ -146,7 +146,7 @@ app.add_middleware(
 - Facilitator client for on-chain verification (or simulate mode for testing)
 - Path prefix stripping for versioned APIs
 
-## MCP Tools (25 available)
+## MCP Tools (53 available)
 
 | Tool | Description |
 |------|-------------|
@@ -173,8 +173,113 @@ app.add_middleware(
 | `list_escrows` | List/filter escrows |
 | `create_split` | Split payment to multiple recipients |
 | `get_split` | Check split payment status |
-| `verify_x402_payment` | **NEW** Verify an x402 payment header |
-| `create_x402_middleware_config` | **NEW** Generate middleware pricing config |
+| `verify_x402_payment` | Verify an x402 payment header |
+| `create_x402_middleware_config` | Generate middleware pricing config |
+| `record_usage` | Record metered usage event |
+| `get_usage_summary` | Get usage summary |
+| `settle_usage` | Settle accumulated usage |
+| `list_usage_events` | List usage events |
+| `register_service` | Register an agent service |
+| `publish_service` | Publish service to marketplace |
+| `search_services` | Search services |
+| `list_services` | List services |
+| `get_service` | Get service details |
+| `purchase_service` | Purchase a service |
+| `create_plan` | Create subscription plan |
+| `subscribe_to_plan` | Subscribe to a plan |
+| `review_service` | Review a service |
+| `list_service_reviews` | List service reviews |
+| `set_spend_policy` | Set spend limit/policy |
+| `check_authorization` | Check if charge is allowed |
+| `get_spend_report` | Get spending analytics |
+| `list_spend_policies` | List spend policies |
+| `delete_spend_policy` | Delete a spend policy |
+| `open_dispute` | **NEW** Open a dispute on an escrow |
+| `get_dispute` | **NEW** Get dispute details |
+| `list_disputes` | **NEW** List/filter disputes |
+| `submit_evidence` | **NEW** Submit evidence to a dispute |
+| `send_dispute_message` | **NEW** Send a message in dispute thread |
+| `escalate_dispute` | **NEW** Escalate to arbiter review |
+| `resolve_dispute` | **NEW** Resolve (release/refund/split) |
+| `cancel_dispute` | **NEW** Cancel (withdraw) a dispute |
+| `get_dispute_stats` | **NEW** Aggregate dispute statistics |
+
+## Dispute Resolution (v0.7.0)
+
+### Agent accountability for escrow transactions
+
+When an agent-to-agent deal goes wrong, the binary release/refund isn't enough.
+Parties need a structured process: file a dispute, submit evidence, communicate,
+and get an arbiter decision. This is the backend infrastructure that
+[internet-court-skill](https://github.com/sortis-ai/internet-court-skill) (1.3k⭐)
+proves agents want.
+
+**Lifecycle:** `opened → responded → under_review → resolved_*`
+
+```
+open_dispute     →  submit_evidence  →  send_dispute_message  →  escalate  →  resolve
+   (payer/payee)     (both parties)      (negotiation)            (arbiter)    (release/refund/split)
+```
+
+```python
+from mcp_payments.engine import PaymentEngine
+
+engine = PaymentEngine()
+
+# Payer files a dispute: "The agent didn't deliver"
+dispute = engine.open_dispute(
+    escrow_id=escrow.id,
+    filed_by="payer",
+    reason="Task not completed — report never delivered",
+    category="non_delivery",
+    expires_in_seconds=86400,  # auto-resolve in 24h
+)
+
+# Payer submits evidence
+engine.submit_evidence(
+    dispute_id=dispute.id,
+    submitted_by=payer.id,
+    content="No report received by deadline",
+    evidence_url="https://example.com/empty-inbox.png",
+    evidence_type="screenshot",
+)
+
+# Payee responds
+engine.submit_evidence(
+    dispute_id=dispute.id,
+    submitted_by=payee.id,
+    content="Report delivered — see attached receipt",
+    evidence_url="https://example.com/delivery-receipt.pdf",
+    evidence_type="receipt",
+)
+# Status transitions: opened → responded
+
+# Negotiate
+engine.send_dispute_message(dispute.id, payee.id, "I'll redo it with more detail")
+
+# Escalate if unresolved
+engine.escalate_dispute(dispute.id)
+
+# Arbiter resolves: split 60/40 (partial delivery)
+engine.resolve_dispute(
+    dispute_id=dispute.id,
+    outcome="split",
+    resolved_by=arbiter.id,
+    split_percentage=60,  # 60% back to payer, 40% to payee
+    resolution="Partial quality — 60% refund",
+)
+```
+
+**Resolution outcomes:**
+- **release** — funds released to payee (payer was wrong)
+- **refund** — funds returned to payer (payee was wrong)
+- **split** — funds divided by percentage (partial fault)
+
+**Auto-expiry:** Disputes that expire without resolution are auto-resolved:
+- No response from counterparty → refund payer
+- Responded but unresolved → 50/50 split
+
+**Categories:** `non_delivery`, `poor_quality`, `fraud`, `overcharge`, `non_payment`, `general`
 
 ## Escrow & Split Payments (v0.2.0)
 
@@ -252,9 +357,9 @@ mcp-payments/
 │   ├── engine.py       # Payment processing engine (charge, escrow, split)
 │   ├── middleware.py   # x402 billing middleware (NEW v0.3.0)
 │   ├── storage.py      # JSON-backed storage (swap to SQL for production)
-│   ├── server/         # MCP server (25 tools)
+│   ├── server/         # MCP server (53 tools)
 │   └── cli/            # CLI interface
-├── tests/              # Comprehensive test suite (319 tests)
+├── tests/              # Comprehensive test suite (398 tests)
 └── docs/               # Documentation
 ```
 

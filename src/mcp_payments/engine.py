@@ -14,6 +14,11 @@ from .models import (
     AuthorizationStatus,
     Currency,
     Customer,
+    Dispute,
+    DisputeEvidence,
+    DisputeMessage,
+    DisputeParty,
+    DisputeStatus,
     Escrow,
     EscrowStatus,
     Payment,
@@ -1613,3 +1618,466 @@ class PaymentEngine:
             largest_transaction=round(largest, 2),
             policies_applied=[p.id for p in policies if p.enabled],
         )
+
+    # ── Dispute Resolution (v0.7.0 — agent accountability) ────────────
+    #
+    # Structured dispute lifecycle for escrow transactions. When an
+    # agent-to-agent deal goes wrong, instead of a binary refund/release,
+    # parties file a dispute, submit evidence, communicate, and an arbiter
+    # decides the outcome: release, refund, or split.
+
+    def open_dispute(
+        self,
+        escrow_id: str,
+        filed_by: str,
+        reason: str,
+        category: str = "general",
+        expires_in_seconds: int | None = 86400,
+        metadata: dict | None = None,
+    ) -> Dispute:
+        """Open a dispute on an escrow.
+
+        ``filed_by`` is "payer" or "payee". The escrow must be in HELD
+        or DISPUTED status. Marks the escrow as DISPUTED.
+
+        Auto-expiry (default 24h) lets disputes that receive no response
+        be resolved automatically.
+        """
+        escrow = self.storage.get_escrow(escrow_id)
+        if escrow is None:
+            raise ValueError(f"Escrow not found: {escrow_id}")
+        if escrow.status not in (EscrowStatus.HELD, EscrowStatus.DISPUTED):
+            raise ValueError(f"Cannot dispute escrow with status: {escrow.status.value}")
+
+        party = DisputeParty(filed_by)
+
+        # Check if there's already an active dispute for this escrow
+        existing = self.storage.get_dispute_by_escrow(escrow_id)
+        active = [d for d in existing if d.status not in (
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+            DisputeStatus.CANCELLED,
+            DisputeStatus.EXPIRED,
+        )]
+        if active:
+            raise ValueError(f"Escrow already has an active dispute: {active[0].id}")
+
+        expires_at = None
+        if expires_in_seconds is not None:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+
+        dispute = Dispute(
+            escrow_id=escrow_id,
+            filed_by=party,
+            payer_customer_id=escrow.payer_customer_id,
+            payee_customer_id=escrow.payee_customer_id,
+            amount=escrow.amount,
+            currency=escrow.currency,
+            reason=reason,
+            category=category,
+            expires_at=expires_at,
+            metadata=metadata or {},
+            messages=[DisputeMessage(
+                from_customer_id=escrow.payer_customer_id if party == DisputeParty.PAYER else escrow.payee_customer_id,
+                party=party,
+                message=f"Dispute opened: {reason}",
+                system=True,
+            )],
+        )
+        created = self.storage.create_dispute(dispute)
+
+        # Mark the escrow as disputed
+        self.storage.update_escrow(escrow_id, status=EscrowStatus.DISPUTED, dispute_reason=reason)
+
+        return created
+
+    def get_dispute(self, dispute_id: str) -> Optional[Dispute]:
+        return self.storage.get_dispute(dispute_id)
+
+    def list_disputes(
+        self,
+        customer_id: str | None = None,
+        status: str | None = None,
+        escrow_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Dispute]:
+        return self.storage.list_disputes(
+            customer_id=customer_id,
+            status=status,
+            escrow_id=escrow_id,
+            limit=limit,
+        )
+
+    def submit_evidence(
+        self,
+        dispute_id: str,
+        submitted_by: str,
+        content: str,
+        evidence_url: str | None = None,
+        evidence_type: str = "statement",
+        metadata: dict | None = None,
+    ) -> DisputeEvidence:
+        """Submit evidence to a dispute.
+
+        ``submitted_by`` is the customer ID of whoever is submitting.
+        The party (payer/payee) is inferred from the customer ID.
+        """
+        dispute = self.storage.get_dispute(dispute_id)
+        if dispute is None:
+            raise ValueError(f"Dispute not found: {dispute_id}")
+        if dispute.status in (
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+            DisputeStatus.CANCELLED,
+            DisputeStatus.EXPIRED,
+        ):
+            raise ValueError(f"Cannot submit evidence to a {dispute.status.value} dispute")
+
+        # Determine party
+        if submitted_by == dispute.payer_customer_id:
+            party = DisputeParty.PAYER
+        elif submitted_by == dispute.payee_customer_id:
+            party = DisputeParty.PAYEE
+        else:
+            raise ValueError(f"Customer {submitted_by} is not a party to this dispute")
+
+        evidence = DisputeEvidence(
+            submitted_by=submitted_by,
+            party=party,
+            content=content,
+            evidence_url=evidence_url,
+            evidence_type=evidence_type,
+            metadata=metadata or {},
+        )
+        dispute.evidence.append(evidence)
+        self.storage.update_dispute(dispute_id, evidence=dispute.evidence)
+
+        # If the counterparty responds for the first time, mark as RESPONDED
+        if dispute.status == DisputeStatus.OPENED and party != dispute.filed_by:
+            self.storage.update_dispute(
+                dispute_id,
+                status=DisputeStatus.RESPONDED,
+                responded_at=datetime.now(timezone.utc),
+            )
+
+        return evidence
+
+    def send_dispute_message(
+        self,
+        dispute_id: str,
+        from_customer_id: str,
+        message: str,
+    ) -> DisputeMessage:
+        """Send a message in the dispute communication thread."""
+        dispute = self.storage.get_dispute(dispute_id)
+        if dispute is None:
+            raise ValueError(f"Dispute not found: {dispute_id}")
+        if dispute.status in (
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+            DisputeStatus.CANCELLED,
+            DisputeStatus.EXPIRED,
+        ):
+            raise ValueError(f"Cannot send messages to a {dispute.status.value} dispute")
+
+        if from_customer_id == dispute.payer_customer_id:
+            party = DisputeParty.PAYER
+        elif from_customer_id == dispute.payee_customer_id:
+            party = DisputeParty.PAYEE
+        else:
+            raise ValueError(f"Customer {from_customer_id} is not a party to this dispute")
+
+        msg = DisputeMessage(
+            from_customer_id=from_customer_id,
+            party=party,
+            message=message,
+        )
+        dispute.messages.append(msg)
+        self.storage.update_dispute(dispute_id, messages=dispute.messages)
+
+        # Mark as RESPONDED if counterparty first responds
+        if dispute.status == DisputeStatus.OPENED and party != dispute.filed_by:
+            self.storage.update_dispute(
+                dispute_id,
+                status=DisputeStatus.RESPONDED,
+                responded_at=datetime.now(timezone.utc),
+            )
+
+        return msg
+
+    def escalate_dispute(self, dispute_id: str) -> Optional[Dispute]:
+        """Escalate a dispute to arbiter review."""
+        dispute = self.storage.get_dispute(dispute_id)
+        if dispute is None:
+            return None
+        if dispute.status not in (DisputeStatus.OPENED, DisputeStatus.RESPONDED):
+            raise ValueError(f"Cannot escalate dispute with status: {dispute.status.value}")
+
+        dispute.messages.append(DisputeMessage(
+            from_customer_id="system",
+            party=dispute.filed_by,
+            message="Dispute escalated to arbiter review",
+            system=True,
+        ))
+        return self.storage.update_dispute(
+            dispute_id,
+            status=DisputeStatus.UNDER_REVIEW,
+            messages=dispute.messages,
+        )
+
+    def resolve_dispute(
+        self,
+        dispute_id: str,
+        outcome: str,
+        resolved_by: str,
+        resolution: str = "",
+        split_percentage: float | None = None,
+    ) -> Optional[Dispute]:
+        """Resolve a dispute with a binding outcome.
+
+        Outcomes:
+        - "release": funds released to payee
+        - "refund": funds refunded to payer
+        - "split": funds split (requires split_percentage = % to payer)
+
+        ``resolved_by`` is the arbiter's customer ID.
+
+        This method handles the fund movement: credits the appropriate
+        party's balance and updates the escrow.
+        """
+        dispute = self.storage.get_dispute(dispute_id)
+        if dispute is None:
+            return None
+        if dispute.status in (
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+            DisputeStatus.CANCELLED,
+            DisputeStatus.EXPIRED,
+        ):
+            raise ValueError(f"Dispute already resolved with status: {dispute.status.value}")
+
+        escrow = self.storage.get_escrow(dispute.escrow_id)
+
+        outcome_lower = outcome.lower()
+        now = datetime.now(timezone.utc)
+
+        if outcome_lower == "release":
+            status = DisputeStatus.RESOLVED_RELEASE
+            # Credit payee
+            self.storage.update_customer_balance(dispute.payee_customer_id, dispute.amount)
+            if escrow:
+                self.storage.update_escrow(
+                    dispute.escrow_id,
+                    status=EscrowStatus.RELEASED,
+                    released_at=now,
+                )
+            # Record release payment
+            self.storage.create_payment(Payment(
+                customer_id=dispute.payee_customer_id,
+                amount=dispute.amount,
+                currency=dispute.currency,
+                status=PaymentStatus.SUCCEEDED,
+                provider=PaymentProvider.INTERNAL,
+                description=f"[DISPUTE RESOLVED: RELEASE] {resolution}",
+                completed_at=now,
+                provider_transaction_id=f"dsp_rel_{uuid.uuid4().hex[:16]}",
+                metadata={"dispute_id": dispute_id, "outcome": "release"},
+            ))
+
+        elif outcome_lower == "refund":
+            status = DisputeStatus.RESOLVED_REFUND
+            # Credit payer
+            self.storage.update_customer_balance(dispute.payer_customer_id, dispute.amount)
+            if escrow:
+                self.storage.update_escrow(
+                    dispute.escrow_id,
+                    status=EscrowStatus.REFUNDED,
+                    refunded_at=now,
+                )
+            self.storage.create_payment(Payment(
+                customer_id=dispute.payer_customer_id,
+                amount=dispute.amount,
+                currency=dispute.currency,
+                status=PaymentStatus.SUCCEEDED,
+                provider=PaymentProvider.INTERNAL,
+                description=f"[DISPUTE RESOLVED: REFUND] {resolution}",
+                completed_at=now,
+                provider_transaction_id=f"dsp_ref_{uuid.uuid4().hex[:16]}",
+                metadata={"dispute_id": dispute_id, "outcome": "refund"},
+            ))
+
+        elif outcome_lower == "split":
+            if split_percentage is None:
+                raise ValueError("split outcome requires split_percentage (% to payer)")
+            if not 0 <= split_percentage <= 100:
+                raise ValueError("split_percentage must be between 0 and 100")
+            status = DisputeStatus.RESOLVED_SPLIT
+            payer_amount = round(dispute.amount * split_percentage / 100, 2)
+            payee_amount = round(dispute.amount - payer_amount, 2)
+
+            if payer_amount > 0:
+                self.storage.update_customer_balance(dispute.payer_customer_id, payer_amount)
+            if payee_amount > 0:
+                self.storage.update_customer_balance(dispute.payee_customer_id, payee_amount)
+
+            if escrow:
+                self.storage.update_escrow(
+                    dispute.escrow_id,
+                    status=EscrowStatus.RELEASED,  # funds disbursed
+                    released_at=now,
+                )
+
+            for cid, amt, label in [
+                (dispute.payer_customer_id, payer_amount, "payer"),
+                (dispute.payee_customer_id, payee_amount, "payee"),
+            ]:
+                if amt > 0:
+                    self.storage.create_payment(Payment(
+                        customer_id=cid,
+                        amount=amt,
+                        currency=dispute.currency,
+                        status=PaymentStatus.SUCCEEDED,
+                        provider=PaymentProvider.INTERNAL,
+                        description=f"[DISPUTE RESOLVED: SPLIT → {label}] {resolution}",
+                        completed_at=now,
+                        provider_transaction_id=f"dsp_spl_{uuid.uuid4().hex[:16]}",
+                        metadata={"dispute_id": dispute_id, "outcome": "split", "party": label},
+                    ))
+
+        else:
+            raise ValueError(f"Unknown outcome: {outcome}. Use 'release', 'refund', or 'split'")
+
+        dispute.messages.append(DisputeMessage(
+            from_customer_id="system",
+            party=dispute.filed_by,
+            message=f"Dispute resolved: {outcome_lower} — {resolution}",
+            system=True,
+        ))
+
+        return self.storage.update_dispute(
+            dispute_id,
+            status=status,
+            resolved_at=now,
+            resolution=resolution or f"Resolved as {outcome_lower}",
+            resolved_by=resolved_by,
+            split_percentage=split_percentage,
+            messages=dispute.messages,
+        )
+
+    def cancel_dispute(self, dispute_id: str, by_customer_id: str, reason: str = "") -> Optional[Dispute]:
+        """Cancel (withdraw) a dispute. Only the filing party can cancel."""
+        dispute = self.storage.get_dispute(dispute_id)
+        if dispute is None:
+            return None
+        if dispute.status in (
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+            DisputeStatus.CANCELLED,
+            DisputeStatus.EXPIRED,
+        ):
+            raise ValueError(f"Cannot cancel a {dispute.status.value} dispute")
+
+        filer_id = dispute.payer_customer_id if dispute.filed_by == DisputeParty.PAYER else dispute.payee_customer_id
+        if by_customer_id != filer_id:
+            raise ValueError("Only the filing party can cancel a dispute")
+
+        dispute.messages.append(DisputeMessage(
+            from_customer_id="system",
+            party=dispute.filed_by,
+            message=f"Dispute cancelled by filer: {reason}",
+            system=True,
+        ))
+
+        updated = self.storage.update_dispute(
+            dispute_id,
+            status=DisputeStatus.CANCELLED,
+            resolved_at=datetime.now(timezone.utc),
+            resolution=f"Cancelled: {reason}",
+            messages=dispute.messages,
+        )
+
+        # Restore escrow to HELD status
+        esc = self.storage.get_escrow(dispute.escrow_id)
+        if esc:
+            esc.status = EscrowStatus.HELD
+            esc.dispute_reason = None
+            self.storage._save()
+
+        return updated
+
+    def auto_expire_disputes(self) -> list[Dispute]:
+        """Auto-resolve disputes that have expired without resolution.
+
+        If no response was received (still OPENED), refund the payer.
+        If a response was received but not resolved (RESPONDED/UNDER_REVIEW),
+        escalate to arbiter decision (default: split 50/50).
+        """
+        now = datetime.now(timezone.utc)
+        expired = []
+        active_statuses = [DisputeStatus.OPENED, DisputeStatus.RESPONDED, DisputeStatus.UNDER_REVIEW]
+
+        for status in active_statuses:
+            disputes = self.storage.list_disputes(status=status.value, limit=10000)
+            for d in disputes:
+                if d.expires_at and now > d.expires_at:
+                    if d.status == DisputeStatus.OPENED:
+                        # No response — refund payer
+                        self.resolve_dispute(
+                            d.id,
+                            outcome="refund",
+                            resolved_by="system",
+                            resolution="Auto-resolved: no response from counterparty within deadline",
+                        )
+                    else:
+                        # Responded but unresolved — split 50/50
+                        self.resolve_dispute(
+                            d.id,
+                            outcome="split",
+                            resolved_by="system",
+                            split_percentage=50,
+                            resolution="Auto-resolved: parties could not reach agreement within deadline (50/50 split)",
+                        )
+                    resolved = self.storage.get_dispute(d.id)
+                    if resolved:
+                        expired.append(resolved)
+
+        return expired
+
+    def get_dispute_stats(self) -> dict[str, Any]:
+        """Aggregate dispute statistics for dashboards/analytics."""
+        all_disputes = self.storage.list_disputes(limit=100000)
+        by_status: dict[str, int] = {}
+        by_category: dict[str, int] = {}
+        by_outcome: dict[str, int] = {}
+        total_amount = 0.0
+        resolved_count = 0
+
+        resolved_statuses = {
+            DisputeStatus.RESOLVED_RELEASE,
+            DisputeStatus.RESOLVED_REFUND,
+            DisputeStatus.RESOLVED_SPLIT,
+        }
+
+        for d in all_disputes:
+            by_status[d.status.value] = by_status.get(d.status.value, 0) + 1
+            by_category[d.category] = by_category.get(d.category, 0) + 1
+            total_amount += d.amount
+            if d.status in resolved_statuses:
+                resolved_count += 1
+                by_outcome[d.status.value] = by_outcome.get(d.status.value, 0) + 1
+
+        return {
+            "total_disputes": len(all_disputes),
+            "resolved": resolved_count,
+            "active": len(all_disputes) - resolved_count,
+            "resolution_rate": round(resolved_count / len(all_disputes) * 100, 1) if all_disputes else 0.0,
+            "total_disputed_amount": round(total_amount, 2),
+            "by_status": by_status,
+            "by_category": by_category,
+            "by_outcome": by_outcome,
+        }

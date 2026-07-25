@@ -593,6 +593,114 @@ TOOL_DEFINITIONS = [
             "required": ["policy_id"],
         },
     },
+    # ── v0.7.0: Dispute Resolution ─────────────────────────────────────
+    {
+        "name": "open_dispute",
+        "description": "Open a dispute on an escrow transaction between two agents. Use when a deal goes wrong: the payer didn't get what they paid for, or the payee wasn't released funds after completing work. The dispute enters a structured lifecycle: evidence submission, communication, and arbiter resolution (release, refund, or split).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "escrow_id": {"type": "string", "description": "The escrow to dispute"},
+                "filed_by": {"type": "string", "enum": ["payer", "payee"], "description": "Who is filing the dispute"},
+                "reason": {"type": "string", "description": "Why the dispute is being filed (e.g. 'Task not completed', 'Funds not released after delivery')"},
+                "category": {"type": "string", "default": "general", "description": "non_delivery, poor_quality, fraud, overcharge, non_payment, etc."},
+                "expires_in_seconds": {"type": "integer", "default": 86400, "description": "Auto-resolve deadline (default 24h)"},
+            },
+            "required": ["escrow_id", "filed_by", "reason"],
+        },
+    },
+    {
+        "name": "get_dispute",
+        "description": "Get full details of a dispute, including status, evidence, and message thread.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"dispute_id": {"type": "string"}},
+            "required": ["dispute_id"],
+        },
+    },
+    {
+        "name": "list_disputes",
+        "description": "List disputes with optional filters. Use to find disputes for a customer, by status, or for a specific escrow.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string", "description": "Filter to disputes involving this customer"},
+                "status": {"type": "string", "enum": ["opened", "responded", "under_review", "resolved_release", "resolved_refund", "resolved_split", "cancelled", "expired"]},
+                "escrow_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+    },
+    {
+        "name": "submit_evidence",
+        "description": "Submit evidence to a dispute. Evidence can be a text statement, a URL to a proof artifact (screenshot, transcript, code commit), or structured data. Both parties can submit evidence. The counterparty's first evidence submission transitions the dispute to 'responded'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dispute_id": {"type": "string"},
+                "submitted_by": {"type": "string", "description": "Customer ID of whoever is submitting"},
+                "content": {"type": "string", "description": "Text evidence or description"},
+                "evidence_url": {"type": "string", "description": "URL to external proof artifact (optional)"},
+                "evidence_type": {"type": "string", "default": "statement", "description": "statement, screenshot, transcript, commit, receipt, etc."},
+            },
+            "required": ["dispute_id", "submitted_by", "content"],
+        },
+    },
+    {
+        "name": "send_dispute_message",
+        "description": "Send a message in the dispute communication thread. Both parties can communicate to negotiate a resolution.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dispute_id": {"type": "string"},
+                "from_customer_id": {"type": "string"},
+                "message": {"type": "string"},
+            },
+            "required": ["dispute_id", "from_customer_id", "message"],
+        },
+    },
+    {
+        "name": "escalate_dispute",
+        "description": "Escalate a dispute to arbiter review. Use when parties cannot reach an agreement and a mediator needs to decide.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"dispute_id": {"type": "string"}},
+            "required": ["dispute_id"],
+        },
+    },
+    {
+        "name": "resolve_dispute",
+        "description": "Resolve a dispute with a binding outcome. Handles fund movement: 'release' credits the payee, 'refund' credits the payer, 'split' divides funds by percentage. Only an arbiter (or system auto-expiry) should call this.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dispute_id": {"type": "string"},
+                "outcome": {"type": "string", "enum": ["release", "refund", "split"], "description": "release=funds to payee, refund=funds to payer, split=divide"},
+                "resolved_by": {"type": "string", "description": "Customer ID of the arbiter resolving this"},
+                "resolution": {"type": "string", "description": "Outcome description / reasoning"},
+                "split_percentage": {"type": "number", "description": "If outcome=split: percentage to payer (0-100)"},
+            },
+            "required": ["dispute_id", "outcome", "resolved_by"],
+        },
+    },
+    {
+        "name": "cancel_dispute",
+        "description": "Cancel (withdraw) a dispute. Only the filing party can cancel. Restores the escrow to held status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dispute_id": {"type": "string"},
+                "by_customer_id": {"type": "string", "description": "Customer ID of the filing party"},
+                "reason": {"type": "string", "default": ""},
+            },
+            "required": ["dispute_id", "by_customer_id"],
+        },
+    },
+    {
+        "name": "get_dispute_stats",
+        "description": "Get aggregate dispute statistics — total disputes, resolution rate, breakdowns by status, category, and outcome. Useful for monitoring agent transaction health.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -1393,4 +1501,180 @@ class MCPServer:
             "policy_id": args["policy_id"],
             "deleted": deleted,
         }
+
+    # ── v0.7.0: Dispute Resolution Handlers ────────────────────────────
+
+    def _tool_open_dispute(self, args: dict) -> dict:
+        dispute = self.engine.open_dispute(
+            escrow_id=args["escrow_id"],
+            filed_by=args["filed_by"],
+            reason=args["reason"],
+            category=args.get("category", "general"),
+            expires_in_seconds=args.get("expires_in_seconds", 86400),
+        )
+        return {
+            "dispute_id": dispute.id,
+            "escrow_id": dispute.escrow_id,
+            "status": dispute.status.value,
+            "filed_by": dispute.filed_by.value,
+            "amount": dispute.amount,
+            "currency": dispute.currency.value,
+            "reason": dispute.reason,
+            "category": dispute.category,
+            "created_at": dispute.created_at.isoformat(),
+            "expires_at": dispute.expires_at.isoformat() if dispute.expires_at else None,
+        }
+
+    def _tool_get_dispute(self, args: dict) -> dict:
+        dispute = self.engine.get_dispute(args["dispute_id"])
+        if dispute is None:
+            return {"error": "Dispute not found"}
+        return {
+            "dispute_id": dispute.id,
+            "escrow_id": dispute.escrow_id,
+            "filed_by": dispute.filed_by.value,
+            "payer_customer_id": dispute.payer_customer_id,
+            "payee_customer_id": dispute.payee_customer_id,
+            "amount": dispute.amount,
+            "currency": dispute.currency.value,
+            "status": dispute.status.value,
+            "reason": dispute.reason,
+            "category": dispute.category,
+            "resolution": dispute.resolution,
+            "resolved_by": dispute.resolved_by,
+            "split_percentage": dispute.split_percentage,
+            "evidence_count": len(dispute.evidence),
+            "evidence": [
+                {
+                    "evidence_id": e.id,
+                    "submitted_by": e.submitted_by,
+                    "party": e.party.value,
+                    "content": e.content,
+                    "evidence_url": e.evidence_url,
+                    "evidence_type": e.evidence_type,
+                    "submitted_at": e.submitted_at.isoformat(),
+                }
+                for e in dispute.evidence
+            ],
+            "messages": [
+                {
+                    "message_id": m.id,
+                    "from": m.from_customer_id,
+                    "party": m.party.value,
+                    "message": m.message,
+                    "system": m.system,
+                    "sent_at": m.sent_at.isoformat(),
+                }
+                for m in dispute.messages
+            ],
+            "created_at": dispute.created_at.isoformat(),
+            "responded_at": dispute.responded_at.isoformat() if dispute.responded_at else None,
+            "resolved_at": dispute.resolved_at.isoformat() if dispute.resolved_at else None,
+            "expires_at": dispute.expires_at.isoformat() if dispute.expires_at else None,
+        }
+
+    def _tool_list_disputes(self, args: dict) -> dict:
+        disputes = self.engine.list_disputes(
+            customer_id=args.get("customer_id"),
+            status=args.get("status"),
+            escrow_id=args.get("escrow_id"),
+            limit=args.get("limit", 50),
+        )
+        return {
+            "count": len(disputes),
+            "disputes": [
+                {
+                    "dispute_id": d.id,
+                    "escrow_id": d.escrow_id,
+                    "status": d.status.value,
+                    "filed_by": d.filed_by.value,
+                    "amount": d.amount,
+                    "reason": d.reason[:80],
+                    "category": d.category,
+                    "evidence_count": len(d.evidence),
+                    "created_at": d.created_at.isoformat(),
+                    "resolved_at": d.resolved_at.isoformat() if d.resolved_at else None,
+                }
+                for d in disputes
+            ],
+        }
+
+    def _tool_submit_evidence(self, args: dict) -> dict:
+        evidence = self.engine.submit_evidence(
+            dispute_id=args["dispute_id"],
+            submitted_by=args["submitted_by"],
+            content=args["content"],
+            evidence_url=args.get("evidence_url"),
+            evidence_type=args.get("evidence_type", "statement"),
+        )
+        return {
+            "evidence_id": evidence.id,
+            "dispute_id": args["dispute_id"],
+            "submitted_by": evidence.submitted_by,
+            "party": evidence.party.value,
+            "evidence_type": evidence.evidence_type,
+            "submitted_at": evidence.submitted_at.isoformat(),
+        }
+
+    def _tool_send_dispute_message(self, args: dict) -> dict:
+        msg = self.engine.send_dispute_message(
+            dispute_id=args["dispute_id"],
+            from_customer_id=args["from_customer_id"],
+            message=args["message"],
+        )
+        return {
+            "message_id": msg.id,
+            "dispute_id": args["dispute_id"],
+            "from": msg.from_customer_id,
+            "party": msg.party.value,
+            "message": msg.message,
+            "sent_at": msg.sent_at.isoformat(),
+        }
+
+    def _tool_escalate_dispute(self, args: dict) -> dict:
+        dispute = self.engine.escalate_dispute(args["dispute_id"])
+        if dispute is None:
+            return {"error": "Dispute not found"}
+        return {
+            "dispute_id": dispute.id,
+            "status": dispute.status.value,
+            "message": "Dispute escalated to arbiter review",
+        }
+
+    def _tool_resolve_dispute(self, args: dict) -> dict:
+        dispute = self.engine.resolve_dispute(
+            dispute_id=args["dispute_id"],
+            outcome=args["outcome"],
+            resolved_by=args["resolved_by"],
+            resolution=args.get("resolution", ""),
+            split_percentage=args.get("split_percentage"),
+        )
+        if dispute is None:
+            return {"error": "Dispute not found"}
+        return {
+            "dispute_id": dispute.id,
+            "status": dispute.status.value,
+            "outcome": args["outcome"],
+            "resolution": dispute.resolution,
+            "resolved_by": dispute.resolved_by,
+            "resolved_at": dispute.resolved_at.isoformat() if dispute.resolved_at else None,
+            "split_percentage": dispute.split_percentage,
+        }
+
+    def _tool_cancel_dispute(self, args: dict) -> dict:
+        dispute = self.engine.cancel_dispute(
+            dispute_id=args["dispute_id"],
+            by_customer_id=args["by_customer_id"],
+            reason=args.get("reason", ""),
+        )
+        if dispute is None:
+            return {"error": "Dispute not found"}
+        return {
+            "dispute_id": dispute.id,
+            "status": dispute.status.value,
+            "resolution": dispute.resolution,
+        }
+
+    def _tool_get_dispute_stats(self, args: dict) -> dict:
+        return self.engine.get_dispute_stats()
 

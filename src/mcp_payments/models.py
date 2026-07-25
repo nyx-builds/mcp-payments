@@ -506,3 +506,83 @@ class SpendReport(BaseModel):
     average_transaction: float = Field(default=0.0)
     largest_transaction: float = Field(default=0.0)
     policies_applied: list[str] = Field(default_factory=list, description="Policy IDs that affected this customer")
+
+
+# ── v0.7.0: Dispute Resolution (agent-to-agent accountability) ─────────────
+
+class DisputeStatus(str, Enum):
+    """Lifecycle stages of a dispute."""
+    OPENED = "opened"              # dispute filed, awaiting response
+    RESPONDED = "responded"        # counterparty has responded
+    UNDER_REVIEW = "under_review"  # an arbiter is reviewing
+    RESOLVED_RELEASE = "resolved_release"  # funds released to payee
+    RESOLVED_REFUND = "resolved_refund"    # funds refunded to payer
+    RESOLVED_SPLIT = "resolved_split"      # funds split between parties
+    CANCELLED = "cancelled"        # withdrawn by the filer
+    EXPIRED = "expired"            # auto-resolved due to timeout
+
+
+class DisputeParty(str, Enum):
+    """Who filed the dispute."""
+    PAYER = "payer"    # paying agent disputes (e.g. task not done)
+    PAYEE = "payee"    # working agent disputes (e.g. non-release after completion)
+
+
+class DisputeEvidence(BaseModel):
+    """A piece of evidence submitted in a dispute.
+
+    Evidence can be a text statement, a URL to a proof artifact
+    (screenshot, transcript, code commit, etc.), or structured data.
+    """
+    id: str = Field(default_factory=lambda: f"evd_{uuid.uuid4().hex[:24]}")
+    submitted_by: str = Field(..., description="Customer ID of who submitted this evidence")
+    party: DisputeParty
+    content: str = Field(..., min_length=1, description="Text evidence or description")
+    evidence_url: Optional[str] = Field(default=None, description="URL to external proof artifact")
+    evidence_type: str = Field(default="statement", description="statement, screenshot, transcript, commit, receipt, etc.")
+    submitted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DisputeMessage(BaseModel):
+    """A message in the dispute communication thread."""
+    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
+    from_customer_id: str
+    party: DisputeParty
+    message: str = Field(..., min_length=1)
+    sent_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    system: bool = Field(default=False, description="True for system-generated messages")
+
+
+class Dispute(BaseModel):
+    """A dispute over an escrow transaction between two agents.
+
+    Full lifecycle: OPENED → RESPONDED → UNDER_REVIEW → RESOLVED_*
+    Evidence is submitted by both parties. An arbiter (platform operator
+    or designated mediator) reviews and decides the outcome.
+
+    Inspired by the internet-court model: agents transact via escrow,
+    and when something goes wrong, a structured dispute process replaces
+    the current binary "just refund or release" choice.
+    """
+    id: str = Field(default_factory=lambda: f"dsp_{uuid.uuid4().hex[:24]}")
+    escrow_id: str = Field(..., description="The escrow being disputed")
+    filed_by: DisputeParty = Field(..., description="Who filed the dispute")
+    payer_customer_id: str
+    payee_customer_id: str
+    amount: float = Field(..., ge=0, description="Disputed amount (from escrow)")
+    currency: Currency = Field(default=Currency.USD)
+    status: DisputeStatus = Field(default=DisputeStatus.OPENED)
+    reason: str = Field(..., min_length=1, description="Why the dispute was filed")
+    category: str = Field(default="general", description="non_delivery, poor_quality, fraud, overcharge, non_payment, etc.")
+    evidence: list[DisputeEvidence] = Field(default_factory=list)
+    messages: list[DisputeMessage] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    responded_at: Optional[datetime] = Field(default=None, description="When counterparty first responded")
+    resolved_at: Optional[datetime] = Field(default=None)
+    resolution: Optional[str] = Field(default=None, description="Outcome description")
+    resolved_by: Optional[str] = Field(default=None, description="Arbiter customer ID")
+    split_percentage: Optional[float] = Field(default=None, ge=0, le=100, description="If RESOLVED_SPLIT: % to payer")
+    expires_at: Optional[datetime] = Field(default=None, description="Auto-resolve deadline")
+    metadata: dict[str, Any] = Field(default_factory=dict)

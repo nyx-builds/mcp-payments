@@ -9,6 +9,7 @@ from typing import Optional
 
 from .models import (
     Customer,
+    Dispute,
     Escrow,
     Payment,
     PaymentIntent,
@@ -44,6 +45,7 @@ class Storage:
         self._plans: dict[str, "SubscriptionPlan"] = {}
         self._reviews: dict[str, "ServiceReview"] = {}
         self._spend_policies: dict[str, "SpendPolicy"] = {}
+        self._disputes: dict[str, "Dispute"] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -65,6 +67,7 @@ class Storage:
             self._plans = {p["id"]: SubscriptionPlan(**p) for p in raw.get("plans", [])}
             self._reviews = {r["id"]: ServiceReview(**r) for r in raw.get("reviews", [])}
             self._spend_policies = {p["id"]: SpendPolicy(**p) for p in raw.get("spend_policies", [])}
+            self._disputes = {d["id"]: Dispute(**d) for d in raw.get("disputes", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -82,6 +85,7 @@ class Storage:
             "plans": [p.model_dump(mode="json") for p in self._plans.values()],
             "reviews": [r.model_dump(mode="json") for r in self._reviews.values()],
             "spend_policies": [p.model_dump(mode="json") for p in self._spend_policies.values()],
+            "disputes": [d.model_dump(mode="json") for d in self._disputes.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -541,3 +545,61 @@ class Storage:
             if enabled is not None:
                 results = [p for p in results if p.enabled == enabled]
             return results
+
+    # ── Disputes (v0.7.0 — Dispute Resolution) ──────────────────────────
+
+    def create_dispute(self, dispute: "Dispute") -> "Dispute":
+        with self._lock:
+            self._disputes[dispute.id] = dispute
+            self._save()
+            return dispute
+
+    def get_dispute(self, dispute_id: str) -> Optional["Dispute"]:
+        with self._lock:
+            return self._disputes.get(dispute_id)
+
+    def update_dispute(self, dispute_id: str, **kwargs) -> Optional["Dispute"]:
+        with self._lock:
+            d = self._disputes.get(dispute_id)
+            if d is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(d, k):
+                    setattr(d, k, v)
+            d.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return d
+
+    def get_dispute_by_escrow(self, escrow_id: str) -> list["Dispute"]:
+        """Find all disputes related to a given escrow."""
+        with self._lock:
+            return [d for d in self._disputes.values() if d.escrow_id == escrow_id]
+
+    def list_disputes(
+        self,
+        customer_id: Optional[str] = None,
+        status: Optional[str] = None,
+        escrow_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list["Dispute"]:
+        with self._lock:
+            results = list(self._disputes.values())
+            if customer_id:
+                results = [
+                    d for d in results
+                    if d.payer_customer_id == customer_id or d.payee_customer_id == customer_id
+                ]
+            if status:
+                results = [d for d in results if d.status.value == status]
+            if escrow_id:
+                results = [d for d in results if d.escrow_id == escrow_id]
+            results.sort(key=lambda d: d.created_at, reverse=True)
+            return results[:limit]
+
+    def delete_dispute(self, dispute_id: str) -> bool:
+        with self._lock:
+            if dispute_id in self._disputes:
+                del self._disputes[dispute_id]
+                self._save()
+                return True
+            return False
