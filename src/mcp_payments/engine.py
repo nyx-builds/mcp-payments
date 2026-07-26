@@ -25,11 +25,17 @@ from .models import (
     PaymentIntent,
     PaymentProvider,
     PaymentReceipt,
+    PaymentRetry,
     PaymentStatus,
     Price,
     PricingModel,
     Refund,
     RefundStatus,
+    RetryAttempt,
+    RetryConfig,
+    RetryStatus,
+    RetryStrategy,
+    RetryTrigger,
     ServiceListing,
     ServiceReview,
     ServiceStatus,
@@ -250,6 +256,17 @@ class PaymentEngine:
             result = self._process_stripe(payment, customer)
         else:
             result = self._process_onchain(payment, customer)
+
+        # v0.8.0: Auto-create retry process if charge failed and retry is configured
+        if result.status == PaymentStatus.FAILED:
+            retry = self.maybe_create_retry(result)
+            if retry:
+                result.metadata["retry_id"] = retry.id
+                result.metadata["retry_status"] = retry.status.value
+                self.storage.update_payment(
+                    result.id,
+                    metadata={**result.metadata, "retry_id": retry.id},
+                )
 
         return result
 
@@ -2080,4 +2097,434 @@ class PaymentEngine:
             "by_status": by_status,
             "by_category": by_category,
             "by_outcome": by_outcome,
+        }
+
+    # ════════════════════════════════════════════════════════════════════
+    # v0.8.0: Payment Retry & Auto-Recovery
+    # ════════════════════════════════════════════════════════════════════
+
+    # Keywords that indicate a failure is retryable (transient)
+    _RETRYABLE_KEYWORDS = {
+        "insufficient": RetryTrigger.INSUFFICIENT_BALANCE,
+        "timeout": RetryTrigger.PROVIDER_TIMEOUT,
+        "timed out": RetryTrigger.PROVIDER_TIMEOUT,
+        "rate limit": RetryTrigger.RATE_LIMITED,
+        "rate-limited": RetryTrigger.RATE_LIMITED,
+        "429": RetryTrigger.RATE_LIMITED,
+        "503": RetryTrigger.PROVIDER_ERROR,
+        "502": RetryTrigger.PROVIDER_ERROR,
+        "500": RetryTrigger.PROVIDER_ERROR,
+        "network": RetryTrigger.TRANSIENT_FAILURE,
+        "connection": RetryTrigger.TRANSIENT_FAILURE,
+        "temporary": RetryTrigger.TRANSIENT_FAILURE,
+        "unavailable": RetryTrigger.PROVIDER_ERROR,
+    }
+
+    def classify_failure(self, failure_reason: str) -> RetryTrigger:
+        """Classify a failure reason into a retry trigger category.
+
+        Returns ALL_FAILURES if the reason doesn't match a known pattern.
+        """
+        reason_lower = failure_reason.lower()
+        for keyword, trigger in self._RETRYABLE_KEYWORDS.items():
+            if keyword in reason_lower:
+                return trigger
+        return RetryTrigger.ALL_FAILURES
+
+    def _is_retryable(self, failure_reason: str, config: RetryConfig) -> tuple[bool, RetryTrigger]:
+        """Check if a failure is retryable under the given config.
+
+        Returns (is_retryable, trigger_category).
+        """
+        trigger = self.classify_failure(failure_reason)
+
+        # ALL_FAILURES matches anything if configured
+        if RetryTrigger.ALL_FAILURES in config.triggers:
+            return True, trigger
+
+        # Check if the classified trigger is in the config's trigger list
+        if trigger in config.triggers:
+            return True, trigger
+
+        # TRANSIENT_FAILURE is a catch-all for unknown errors — only matches ALL_FAILURES
+        return False, trigger
+
+    def _compute_delay(self, attempt: int, config: RetryConfig) -> float:
+        """Compute the delay (seconds) before the given attempt number.
+
+        attempt=1 is the first retry (after the original failure).
+        """
+        if config.strategy == RetryStrategy.FIXED:
+            delay = config.initial_delay_seconds
+        elif config.strategy == RetryStrategy.LINEAR:
+            delay = config.initial_delay_seconds * attempt
+        else:  # EXPONENTIAL
+            delay = config.initial_delay_seconds * (config.backoff_multiplier ** (attempt - 1))
+
+        return min(delay, config.max_delay_seconds)
+
+    # ── Retry Config Management ──────────────────────────────────────
+
+    def configure_retry(
+        self,
+        customer_id: Optional[str] = None,
+        name: str = "default",
+        triggers: Optional[list[RetryTrigger]] = None,
+        max_attempts: int = 3,
+        strategy: RetryStrategy = RetryStrategy.EXPONENTIAL,
+        initial_delay_seconds: float = 5.0,
+        max_delay_seconds: float = 300.0,
+        backoff_multiplier: float = 2.0,
+        auto_top_up: bool = False,
+        auto_top_up_amount: Optional[float] = None,
+        enabled: bool = True,
+    ) -> RetryConfig:
+        """Create or update a retry configuration.
+
+        If a config with the same customer_id + name exists, it's updated.
+        Otherwise a new one is created.
+        """
+        if triggers is None:
+            triggers = [RetryTrigger.INSUFFICIENT_BALANCE, RetryTrigger.PROVIDER_TIMEOUT]
+
+        # Check for existing config with same customer_id + name
+        existing = None
+        for rc in self.storage.list_retry_configs(limit=10000):
+            if rc.customer_id == customer_id and rc.name == name:
+                existing = rc
+                break
+
+        if existing:
+            updated = self.storage.update_retry_config(
+                existing.id,
+                triggers=triggers,
+                max_attempts=max_attempts,
+                strategy=strategy,
+                initial_delay_seconds=initial_delay_seconds,
+                max_delay_seconds=max_delay_seconds,
+                backoff_multiplier=backoff_multiplier,
+                auto_top_up=auto_top_up,
+                auto_top_up_amount=auto_top_up_amount,
+                enabled=enabled,
+            )
+            if updated is not None:
+                return updated
+
+        config = RetryConfig(
+            customer_id=customer_id,
+            name=name,
+            triggers=triggers,
+            max_attempts=max_attempts,
+            strategy=strategy,
+            initial_delay_seconds=initial_delay_seconds,
+            max_delay_seconds=max_delay_seconds,
+            backoff_multiplier=backoff_multiplier,
+            auto_top_up=auto_top_up,
+            auto_top_up_amount=auto_top_up_amount,
+            enabled=enabled,
+        )
+        return self.storage.create_retry_config(config)
+
+    def get_retry_config(self, config_id: str) -> Optional[RetryConfig]:
+        return self.storage.get_retry_config(config_id)
+
+    def list_retry_configs(
+        self, customer_id: Optional[str] = None, enabled: Optional[bool] = None
+    ) -> list[RetryConfig]:
+        return self.storage.list_retry_configs(customer_id=customer_id, enabled=enabled)
+
+    def delete_retry_config(self, config_id: str) -> bool:
+        return self.storage.delete_retry_config(config_id)
+
+    # ── Retry Lifecycle ──────────────────────────────────────────────
+
+    def maybe_create_retry(self, payment: Payment) -> Optional[PaymentRetry]:
+        """Check if a failed payment should be retried, and create a retry if so.
+
+        Called automatically by charge() when a payment fails. Returns the
+        created PaymentRetry, or None if the failure is not retryable or
+        no config exists.
+        """
+        if payment.status != PaymentStatus.FAILED:
+            return None
+
+        # Find applicable retry config
+        config = self.storage.get_retry_config_for_customer(payment.customer_id)
+        if config is None or not config.enabled:
+            return None
+
+        # Check if failure is retryable
+        reason = payment.failure_reason or "unknown error"
+        is_retryable, trigger = self._is_retryable(reason, config)
+        if not is_retryable:
+            return None
+
+        # Check if a retry already exists for this payment
+        existing = self.storage.get_payment_retry_by_original(payment.id)
+        if existing and existing.status == RetryStatus.ACTIVE:
+            return existing
+
+        # Create the retry process
+        retry = PaymentRetry(
+            original_payment_id=payment.id,
+            customer_id=payment.customer_id,
+            amount=payment.amount,
+            currency=payment.currency,
+            provider=payment.provider,
+            tool_name=payment.tool_name,
+            description=payment.description,
+            config_id=config.id,
+            max_attempts=config.max_attempts,
+            strategy=config.strategy,
+            trigger=trigger,
+            initial_failure_reason=reason,
+        )
+
+        # Schedule first attempt
+        delay = self._compute_delay(1, config)
+        retry.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+
+        # If auto top-up is configured, do it now (before first retry)
+        if config.auto_top_up and config.auto_top_up_amount and trigger == RetryTrigger.INSUFFICIENT_BALANCE:
+            self.storage.update_customer_balance(payment.customer_id, config.auto_top_up_amount)
+            retry.metadata["auto_top_up_applied"] = config.auto_top_up_amount
+
+        return self.storage.create_payment_retry(retry)
+
+    def execute_retry(self, retry_id: str) -> PaymentRetry:
+        """Execute the next retry attempt for a payment retry process.
+
+        Creates a new charge, records the attempt outcome, and either:
+        - Marks the retry as SUCCEEDED if the charge succeeds
+        - Schedules the next attempt if attempts remain
+        - Marks as EXHAUSTED if all attempts are used
+        """
+        retry = self.storage.get_payment_retry(retry_id)
+        if retry is None:
+            raise ValueError(f"Retry not found: {retry_id}")
+
+        if retry.status not in (RetryStatus.ACTIVE, RetryStatus.PAUSED):
+            raise ValueError(f"Retry is not active (status={retry.status.value})")
+
+        next_attempt_num = retry.current_attempt + 1
+        config = self.storage.get_retry_config(retry.config_id)
+        if config is None:
+            raise ValueError(f"Config not found: {retry.config_id}")
+
+        # Compute delay for this attempt
+        delay = self._compute_delay(next_attempt_num, config)
+        now = datetime.now(timezone.utc)
+
+        attempt = RetryAttempt(
+            attempt_number=next_attempt_num,
+            scheduled_at=retry.next_attempt_at or now,
+            executed_at=now,
+            delay_seconds=delay,
+            status=PaymentStatus.PROCESSING,
+        )
+
+        # Execute the charge
+        new_payment = self.storage.create_payment(Payment(
+            customer_id=retry.customer_id,
+            amount=retry.amount,
+            currency=retry.currency,
+            status=PaymentStatus.PROCESSING,
+            provider=retry.provider,
+            tool_name=retry.tool_name,
+            description=f"[RETRY #{next_attempt_num}] {retry.description}",
+            metadata={"retry_id": retry.id, "original_payment_id": retry.original_payment_id, "attempt": next_attempt_num},
+        ))
+
+        # Process based on provider (reuse existing logic)
+        customer = self.storage.get_customer(retry.customer_id)
+        if customer is None:
+            result = self.storage.update_payment(
+                new_payment.id, status=PaymentStatus.FAILED, failure_reason="Customer not found"
+            )
+        elif retry.provider == PaymentProvider.INTERNAL:
+            result = self._process_internal(new_payment, customer)
+        elif retry.provider == PaymentProvider.X402:
+            result = self._process_x402(new_payment, customer)
+        elif retry.provider == PaymentProvider.STRIPE:
+            result = self._process_stripe(new_payment, customer)
+        else:
+            result = self._process_onchain(new_payment, customer)
+
+        result = result or new_payment
+
+        if result.status == PaymentStatus.SUCCEEDED:
+            # Success!
+            attempt.status = PaymentStatus.SUCCEEDED
+            attempt.provider_transaction_id = result.provider_transaction_id
+            retry.attempts.append(attempt)
+            retry.current_attempt = next_attempt_num
+            retry.status = RetryStatus.SUCCEEDED
+            retry.succeeded_payment_id = result.id
+            retry.final_status = PaymentStatus.SUCCEEDED
+            retry.next_attempt_at = None
+            retry.completed_at = now
+            self.storage.update_payment_retry(
+                retry.id,
+                attempts=retry.attempts,
+                current_attempt=retry.current_attempt,
+                status=retry.status,
+                succeeded_payment_id=retry.succeeded_payment_id,
+                final_status=retry.final_status,
+                next_attempt_at=None,
+                completed_at=now,
+            )
+        else:
+            # Failure — check if we have more attempts
+            attempt.status = PaymentStatus.FAILED
+            attempt.failure_reason = result.failure_reason
+            retry.attempts.append(attempt)
+            retry.current_attempt = next_attempt_num
+
+            if next_attempt_num >= retry.max_attempts:
+                # Exhausted
+                retry.status = RetryStatus.EXHAUSTED
+                retry.final_status = PaymentStatus.FAILED
+                retry.next_attempt_at = None
+                retry.completed_at = now
+                self.storage.update_payment_retry(
+                    retry.id,
+                    attempts=retry.attempts,
+                    current_attempt=retry.current_attempt,
+                    status=retry.status,
+                    final_status=retry.final_status,
+                    next_attempt_at=None,
+                    completed_at=now,
+                )
+            else:
+                # Schedule next attempt
+                next_delay = self._compute_delay(next_attempt_num + 1, config)
+                retry.next_attempt_at = now + timedelta(seconds=next_delay)
+                # If auto top-up, top up before next attempt
+                if config.auto_top_up and config.auto_top_up_amount:
+                    self.storage.update_customer_balance(retry.customer_id, config.auto_top_up_amount)
+                    retry.metadata["auto_top_up_count"] = retry.metadata.get("auto_top_up_count", 0) + 1
+                self.storage.update_payment_retry(
+                    retry.id,
+                    attempts=retry.attempts,
+                    current_attempt=retry.current_attempt,
+                    next_attempt_at=retry.next_attempt_at,
+                    metadata=retry.metadata if retry.metadata else None,
+                )
+
+        result = self.storage.get_payment_retry(retry_id)
+        if result is None:
+            raise RuntimeError(f"Retry {retry_id} disappeared after execution")
+        return result
+
+    def process_pending_retries(self, customer_id: Optional[str] = None) -> list[PaymentRetry]:
+        """Process all retries whose next_attempt_at has arrived.
+
+        This is the auto-recovery method — call it periodically (e.g. every
+        few seconds) to execute scheduled retries. Returns the list of
+        retries that were executed this pass.
+        """
+        now = datetime.now(timezone.utc)
+        all_retries = self.storage.list_payment_retries(
+            customer_id=customer_id, status=RetryStatus.ACTIVE.value, limit=10000
+        )
+
+        executed = []
+        for retry in all_retries:
+            if retry.next_attempt_at and retry.next_attempt_at <= now:
+                try:
+                    result = self.execute_retry(retry.id)
+                    executed.append(result)
+                except Exception:
+                    pass  # Skip failed executions
+
+        return executed
+
+    def cancel_retry(self, retry_id: str) -> Optional[PaymentRetry]:
+        """Cancel an active retry process."""
+        retry = self.storage.get_payment_retry(retry_id)
+        if retry is None:
+            return None
+        if retry.status != RetryStatus.ACTIVE:
+            raise ValueError(f"Cannot cancel retry in status {retry.status.value}")
+        now = datetime.now(timezone.utc)
+        # Directly manipulate the object then persist
+        retry.status = RetryStatus.CANCELLED
+        retry.next_attempt_at = None
+        retry.final_status = PaymentStatus.FAILED
+        retry.completed_at = now
+        retry.updated_at = now
+        with self.storage._lock:
+            self.storage._payment_retries[retry_id] = retry
+            self.storage._save()
+        return retry
+
+    def pause_retry(self, retry_id: str) -> Optional[PaymentRetry]:
+        """Temporarily pause an active retry process."""
+        retry = self.storage.get_payment_retry(retry_id)
+        if retry is None:
+            return None
+        if retry.status != RetryStatus.ACTIVE:
+            raise ValueError(f"Cannot pause retry in status {retry.status.value}")
+        return self.storage.update_payment_retry(retry_id, status=RetryStatus.PAUSED)
+
+    def resume_retry(self, retry_id: str) -> Optional[PaymentRetry]:
+        """Resume a paused retry process."""
+        retry = self.storage.get_payment_retry(retry_id)
+        if retry is None:
+            return None
+        if retry.status != RetryStatus.PAUSED:
+            raise ValueError(f"Cannot resume retry in status {retry.status.value}")
+        return self.storage.update_payment_retry(retry_id, status=RetryStatus.ACTIVE)
+
+    def get_retry(self, retry_id: str) -> Optional[PaymentRetry]:
+        """Get a single retry process by ID."""
+        return self.storage.get_payment_retry(retry_id)
+
+    def list_retries(
+        self, customer_id: Optional[str] = None, status: Optional[str] = None
+    ) -> list[PaymentRetry]:
+        """List retry processes, optionally filtered."""
+        return self.storage.list_payment_retries(customer_id=customer_id, status=status)
+
+    def get_retry_stats(self, customer_id: Optional[str] = None) -> dict[str, Any]:
+        """Aggregate retry statistics for dashboards/analytics."""
+        retries = self.storage.list_payment_retries(customer_id=customer_id, limit=100000)
+
+        total = len(retries)
+        by_status: dict[str, int] = {}
+        by_trigger: dict[str, int] = {}
+        succeeded = 0
+        exhausted = 0
+        active = 0
+        total_attempts = 0
+        recovered_amount = 0.0
+
+        for r in retries:
+            by_status[r.status.value] = by_status.get(r.status.value, 0) + 1
+            by_trigger[r.trigger.value] = by_trigger.get(r.trigger.value, 0) + 1
+            total_attempts += r.current_attempt
+
+            if r.status == RetryStatus.SUCCEEDED:
+                succeeded += 1
+                recovered_amount += r.amount
+            elif r.status == RetryStatus.EXHAUSTED:
+                exhausted += 1
+            elif r.status == RetryStatus.ACTIVE:
+                active += 1
+
+        recovery_rate = round(succeeded / total * 100, 1) if total else 0.0
+        avg_attempts = round(total_attempts / total, 1) if total else 0.0
+
+        return {
+            "total_retries": total,
+            "succeeded": succeeded,
+            "exhausted": exhausted,
+            "active": active,
+            "cancelled": by_status.get("cancelled", 0),
+            "paused": by_status.get("paused", 0),
+            "recovery_rate": recovery_rate,
+            "recovered_amount": round(recovered_amount, 2),
+            "average_attempts": avg_attempts,
+            "by_status": by_status,
+            "by_trigger": by_trigger,
         }

@@ -15,6 +15,8 @@ from .models import (
     PaymentIntent,
     PaymentStatus,
     Refund,
+    RetryConfig,
+    PaymentRetry,
     ServiceListing,
     ServiceReview,
     SplitPayment,
@@ -44,8 +46,10 @@ class Storage:
         self._services: dict[str, "ServiceListing"] = {}
         self._plans: dict[str, "SubscriptionPlan"] = {}
         self._reviews: dict[str, "ServiceReview"] = {}
-        self._spend_policies: dict[str, "SpendPolicy"] = {}
-        self._disputes: dict[str, "Dispute"] = {}
+        self._spend_policies: dict[str, SpendPolicy] = {}
+        self._disputes: dict[str, Dispute] = {}
+        self._retry_configs: dict[str, RetryConfig] = {}
+        self._payment_retries: dict[str, PaymentRetry] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -68,6 +72,8 @@ class Storage:
             self._reviews = {r["id"]: ServiceReview(**r) for r in raw.get("reviews", [])}
             self._spend_policies = {p["id"]: SpendPolicy(**p) for p in raw.get("spend_policies", [])}
             self._disputes = {d["id"]: Dispute(**d) for d in raw.get("disputes", [])}
+            self._retry_configs = {rc["id"]: RetryConfig(**rc) for rc in raw.get("retry_configs", [])}
+            self._payment_retries = {pr["id"]: PaymentRetry(**pr) for pr in raw.get("payment_retries", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -86,6 +92,8 @@ class Storage:
             "reviews": [r.model_dump(mode="json") for r in self._reviews.values()],
             "spend_policies": [p.model_dump(mode="json") for p in self._spend_policies.values()],
             "disputes": [d.model_dump(mode="json") for d in self._disputes.values()],
+            "retry_configs": [rc.model_dump(mode="json") for rc in self._retry_configs.values()],
+            "payment_retries": [pr.model_dump(mode="json") for pr in self._payment_retries.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -600,6 +608,134 @@ class Storage:
         with self._lock:
             if dispute_id in self._disputes:
                 del self._disputes[dispute_id]
+                self._save()
+                return True
+            return False
+
+    # ── Retry Configs ─────────────────────────────────────────────────
+
+    def create_retry_config(self, config: RetryConfig) -> RetryConfig:
+        with self._lock:
+            self._retry_configs[config.id] = config
+            self._save()
+            return config
+
+    def get_retry_config(self, config_id: str) -> Optional[RetryConfig]:
+        with self._lock:
+            return self._retry_configs.get(config_id)
+
+    def get_retry_config_for_customer(self, customer_id: str) -> Optional[RetryConfig]:
+        """Find the best retry config for a customer.
+
+        Priority: customer-specific > global default (customer_id=None).
+        If multiple customer-specific configs exist, returns the first
+        enabled one (most recently updated).
+        """
+        with self._lock:
+            # Customer-specific first
+            customer_configs = [
+                rc for rc in self._retry_configs.values()
+                if rc.customer_id == customer_id and rc.enabled
+            ]
+            if customer_configs:
+                customer_configs.sort(key=lambda c: c.updated_at, reverse=True)
+                return customer_configs[0]
+            # Fall back to global default
+            global_configs = [
+                rc for rc in self._retry_configs.values()
+                if rc.customer_id is None and rc.enabled
+            ]
+            if global_configs:
+                global_configs.sort(key=lambda c: c.updated_at, reverse=True)
+                return global_configs[0]
+            return None
+
+    def list_retry_configs(
+        self,
+        customer_id: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        limit: int = 100,
+    ) -> list[RetryConfig]:
+        with self._lock:
+            results = list(self._retry_configs.values())
+            if customer_id is not None:
+                results = [rc for rc in results if rc.customer_id == customer_id]
+            if enabled is not None:
+                results = [rc for rc in results if rc.enabled == enabled]
+            results.sort(key=lambda c: c.created_at, reverse=True)
+            return results[:limit]
+
+    def update_retry_config(self, config_id: str, **kwargs) -> Optional[RetryConfig]:
+        with self._lock:
+            rc = self._retry_configs.get(config_id)
+            if rc is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(rc, k) and v is not None:
+                    setattr(rc, k, v)
+            rc.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return rc
+
+    def delete_retry_config(self, config_id: str) -> bool:
+        with self._lock:
+            if config_id in self._retry_configs:
+                del self._retry_configs[config_id]
+                self._save()
+                return True
+            return False
+
+    # ── Payment Retries ───────────────────────────────────────────────
+
+    def create_payment_retry(self, retry: PaymentRetry) -> PaymentRetry:
+        with self._lock:
+            self._payment_retries[retry.id] = retry
+            self._save()
+            return retry
+
+    def get_payment_retry(self, retry_id: str) -> Optional[PaymentRetry]:
+        with self._lock:
+            return self._payment_retries.get(retry_id)
+
+    def get_payment_retry_by_original(self, payment_id: str) -> Optional[PaymentRetry]:
+        """Find the active retry process for a given failed payment."""
+        with self._lock:
+            for retry in self._payment_retries.values():
+                if retry.original_payment_id == payment_id:
+                    return retry
+            return None
+
+    def update_payment_retry(self, retry_id: str, **kwargs) -> Optional[PaymentRetry]:
+        with self._lock:
+            pr = self._payment_retries.get(retry_id)
+            if pr is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(pr, k) and v is not None:
+                    setattr(pr, k, v)
+            pr.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return pr
+
+    def list_payment_retries(
+        self,
+        customer_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[PaymentRetry]:
+        with self._lock:
+            results = list(self._payment_retries.values())
+            if customer_id:
+                results = [r for r in results if r.customer_id == customer_id]
+            if status:
+                results = [r for r in results if r.status.value == status]
+            results.sort(key=lambda r: r.created_at, reverse=True)
+            return results[:limit]
+
+    def delete_payment_retry(self, retry_id: str) -> bool:
+        with self._lock:
+            if retry_id in self._payment_retries:
+                del self._payment_retries[retry_id]
                 self._save()
                 return True
             return False

@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 53
+        assert len(TOOL_DEFINITIONS) == 60
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -65,6 +65,10 @@ class TestToolDefinitions:
             "open_dispute", "get_dispute", "list_disputes",
             "submit_evidence", "send_dispute_message", "escalate_dispute",
             "resolve_dispute", "cancel_dispute", "get_dispute_stats",
+            # v0.8.0
+            "configure_retry", "get_retry", "list_retries",
+            "execute_retry", "process_pending_retries", "cancel_retry",
+            "get_retry_stats",
         }
         assert names == expected
 
@@ -72,7 +76,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 53
+        assert len(tools) == 60
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()

@@ -701,6 +701,85 @@ TOOL_DEFINITIONS = [
         "description": "Get aggregate dispute statistics — total disputes, resolution rate, breakdowns by status, category, and outcome. Useful for monitoring agent transaction health.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    # ── v0.8.0: Payment Retry & Auto-Recovery ──
+    {
+        "name": "configure_retry",
+        "description": "Configure automatic payment retry behavior. When a charge fails due to a recoverable condition (insufficient balance, provider timeout, rate limit), payments can be automatically retried with configurable backoff. Inspired by self-healing agent payment infrastructure (helix, 823⭐).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string", "description": "Customer ID to scope this config to (omit for global default)"},
+                "name": {"type": "string", "default": "default", "description": "Config name"},
+                "triggers": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["insufficient_balance", "provider_timeout", "provider_error", "rate_limited", "transient_failure", "all_failures"]},
+                    "description": "Failure conditions that trigger retries",
+                },
+                "max_attempts": {"type": "integer", "default": 3, "minimum": 1, "maximum": 20},
+                "strategy": {"type": "string", "enum": ["fixed", "exponential", "linear"], "default": "exponential"},
+                "initial_delay_seconds": {"type": "number", "default": 5.0},
+                "max_delay_seconds": {"type": "number", "default": 300.0},
+                "backoff_multiplier": {"type": "number", "default": 2.0},
+                "auto_top_up": {"type": "boolean", "default": False, "description": "Auto top-up balance before retrying insufficient balance failures"},
+                "auto_top_up_amount": {"type": "number", "description": "Amount to auto top-up"},
+                "enabled": {"type": "boolean", "default": True},
+            },
+        },
+    },
+    {
+        "name": "get_retry",
+        "description": "Get details of a payment retry process by ID. Shows all attempts, their outcomes, and the current retry status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"retry_id": {"type": "string"}},
+            "required": ["retry_id"],
+        },
+    },
+    {
+        "name": "list_retries",
+        "description": "List payment retry processes, optionally filtered by customer or status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["active", "succeeded", "exhausted", "cancelled", "paused"]},
+            },
+        },
+    },
+    {
+        "name": "execute_retry",
+        "description": "Execute the next retry attempt for a payment retry process immediately (instead of waiting for the scheduled time). Useful for manual recovery.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"retry_id": {"type": "string"}},
+            "required": ["retry_id"],
+        },
+    },
+    {
+        "name": "process_pending_retries",
+        "description": "Process all pending payment retries that are due. This is the auto-recovery sweep — call periodically to execute scheduled retries. Returns all retries that were processed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"customer_id": {"type": "string", "description": "Optional: only process retries for this customer"}},
+        },
+    },
+    {
+        "name": "cancel_retry",
+        "description": "Cancel an active payment retry process. No further attempts will be made.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"retry_id": {"type": "string"}},
+            "required": ["retry_id"],
+        },
+    },
+    {
+        "name": "get_retry_stats",
+        "description": "Get aggregate retry statistics — recovery rate, total retries, amounts recovered, breakdowns by status and trigger. Useful for monitoring payment health.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"customer_id": {"type": "string", "description": "Optional: scope stats to one customer"}},
+        },
+    },
 ]
 
 
@@ -1677,4 +1756,114 @@ class MCPServer:
 
     def _tool_get_dispute_stats(self, args: dict) -> dict:
         return self.engine.get_dispute_stats()
+
+    # ── v0.8.0: Payment Retry & Auto-Recovery ──────────────────────────
+
+    def _tool_configure_retry(self, args: dict) -> dict:
+        from ..models import RetryTrigger, RetryStrategy
+
+        triggers = None
+        if args.get("triggers"):
+            triggers = [RetryTrigger(t) for t in args["triggers"]]
+
+        config = self.engine.configure_retry(
+            customer_id=args.get("customer_id"),
+            name=args.get("name", "default"),
+            triggers=triggers,
+            max_attempts=args.get("max_attempts", 3),
+            strategy=RetryStrategy(args.get("strategy", "exponential")),
+            initial_delay_seconds=args.get("initial_delay_seconds", 5.0),
+            max_delay_seconds=args.get("max_delay_seconds", 300.0),
+            backoff_multiplier=args.get("backoff_multiplier", 2.0),
+            auto_top_up=args.get("auto_top_up", False),
+            auto_top_up_amount=args.get("auto_top_up_amount"),
+            enabled=args.get("enabled", True),
+        )
+        return {
+            "config_id": config.id,
+            "customer_id": config.customer_id,
+            "name": config.name,
+            "triggers": [t.value for t in config.triggers],
+            "max_attempts": config.max_attempts,
+            "strategy": config.strategy.value,
+            "initial_delay_seconds": config.initial_delay_seconds,
+            "max_delay_seconds": config.max_delay_seconds,
+            "backoff_multiplier": config.backoff_multiplier,
+            "auto_top_up": config.auto_top_up,
+            "auto_top_up_amount": config.auto_top_up_amount,
+            "enabled": config.enabled,
+        }
+
+    def _tool_get_retry(self, args: dict) -> dict:
+        retry = self.engine.get_retry(args["retry_id"])
+        if retry is None:
+            return {"error": "Retry not found"}
+        return self._serialize_retry(retry)
+
+    def _tool_list_retries(self, args: dict) -> dict:
+        retries = self.engine.list_retries(
+            customer_id=args.get("customer_id"),
+            status=args.get("status"),
+        )
+        return {
+            "count": len(retries),
+            "retries": [self._serialize_retry(r) for r in retries],
+        }
+
+    def _tool_execute_retry(self, args: dict) -> dict:
+        retry = self.engine.execute_retry(args["retry_id"])
+        return self._serialize_retry(retry)
+
+    def _tool_process_pending_retries(self, args: dict) -> dict:
+        processed = self.engine.process_pending_retries(args.get("customer_id"))
+        return {
+            "processed_count": len(processed),
+            "retries": [self._serialize_retry(r) for r in processed],
+        }
+
+    def _tool_cancel_retry(self, args: dict) -> dict:
+        retry = self.engine.cancel_retry(args["retry_id"])
+        if retry is None:
+            return {"error": "Retry not found"}
+        return self._serialize_retry(retry)
+
+    def _tool_get_retry_stats(self, args: dict) -> dict:
+        return self.engine.get_retry_stats(args.get("customer_id"))
+
+    def _serialize_retry(self, retry) -> dict:
+        """Serialize a PaymentRetry for JSON output."""
+        return {
+            "id": retry.id,
+            "original_payment_id": retry.original_payment_id,
+            "customer_id": retry.customer_id,
+            "amount": retry.amount,
+            "currency": retry.currency.value,
+            "provider": retry.provider.value,
+            "tool_name": retry.tool_name,
+            "description": retry.description,
+            "config_id": retry.config_id,
+            "max_attempts": retry.max_attempts,
+            "strategy": retry.strategy.value,
+            "trigger": retry.trigger.value,
+            "initial_failure_reason": retry.initial_failure_reason,
+            "status": retry.status.value,
+            "current_attempt": retry.current_attempt,
+            "next_attempt_at": retry.next_attempt_at.isoformat() if retry.next_attempt_at else None,
+            "succeeded_payment_id": retry.succeeded_payment_id,
+            "final_status": retry.final_status.value if retry.final_status else None,
+            "attempts": [
+                {
+                    "attempt_number": a.attempt_number,
+                    "executed_at": a.executed_at.isoformat() if a.executed_at else None,
+                    "status": a.status.value,
+                    "delay_seconds": a.delay_seconds,
+                    "failure_reason": a.failure_reason,
+                    "provider_transaction_id": a.provider_transaction_id,
+                }
+                for a in retry.attempts
+            ],
+            "created_at": retry.created_at.isoformat(),
+            "completed_at": retry.completed_at.isoformat() if retry.completed_at else None,
+            "metadata": retry.metadata,
+        }
 

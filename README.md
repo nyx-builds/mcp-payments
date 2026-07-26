@@ -5,10 +5,10 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/mcp-payments/actions/workflows/ci.yml)
-[![319 tests](https://img.shields.io/badge/tests-319%20passing-brightgreen.svg)](#)
+[![454 tests](https://img.shields.io/badge/tests-454%20passing-brightgreen.svg)](#)
 [![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](https://modelcontextprotocol.io)
 [![x402](https://img.shields.io/badge/x402-ready-orange.svg)](https://github.com/x402-protocol)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](#)
 
 ## Why?
 
@@ -17,7 +17,8 @@ The MCP ecosystem has **no payment layer**. Agents can call tools, read resource
 **mcp-payments** fills this gap:
 - 🔧 **MCP-native** — pricing is part of tool discovery
 - 💸 **Multi-provider** — internal ledger, Stripe (fiat), x402 (crypto), on-chain
-- 🛒 **Service Marketplace Registry (NEW v0.5.0)** — agents discover, purchase, and provision paid services in one flow
+- 🔄 **Payment Retry & Auto-Recovery (NEW v0.8.0)** — self-healing payments: failed charges auto-retry with configurable backoff, auto top-up, and failure classification
+- 🛒 **Service Marketplace Registry (v0.5.0)** — agents discover, purchase, and provision paid services in one flow
 - 📊 **Usage metering (v0.4.0)** — record, aggregate, and settle metered billing (per-call, per-token, per-second)
 - 🔗 **x402 billing middleware (v0.3.0)** — enforce HTTP 402 payments on any ASGI app
 - 📊 **Full lifecycle** — pricing → intent → charge → verify → refund → receipt
@@ -146,7 +147,7 @@ app.add_middleware(
 - Facilitator client for on-chain verification (or simulate mode for testing)
 - Path prefix stripping for versioned APIs
 
-## MCP Tools (53 available)
+## MCP Tools (60 available)
 
 | Tool | Description |
 |------|-------------|
@@ -202,7 +203,81 @@ app.add_middleware(
 | `escalate_dispute` | **NEW** Escalate to arbiter review |
 | `resolve_dispute` | **NEW** Resolve (release/refund/split) |
 | `cancel_dispute` | **NEW** Cancel (withdraw) a dispute |
-| `get_dispute_stats` | **NEW** Aggregate dispute statistics |
+| `get_dispute_stats` | Aggregate dispute statistics |
+| `configure_retry` | **NEW** Configure auto-retry behavior (triggers, strategy, limits) |
+| `get_retry` | **NEW** Get retry process details + attempt history |
+| `list_retries` | **NEW** List/filter retry processes |
+| `execute_retry` | **NEW** Execute next retry attempt immediately |
+| `cancel_retry` | **NEW** Cancel an active retry process |
+| `process_pending_retries` | **NEW** Sweep all due retries (auto-recovery) |
+| `get_retry_stats` | **NEW** Aggregate retry statistics (recovery rate, etc.) |
+
+## Payment Retry & Auto-Recovery (v0.8.0)
+
+### Self-healing payments for autonomous agents
+
+When agents operate autonomously, payment failures are inevitable — insufficient balance,
+provider timeouts, rate limits. Without retry logic, a transient failure kills the entire
+agent workflow. **mcp-payments** now has a complete retry & auto-recovery layer: failed charges
+are automatically retried with configurable backoff strategies, and an auto top-up hook can
+replenish balance before the next attempt.
+
+**Lifecycle:** `charge fails → retry created → attempts scheduled → succeeded | exhausted | cancelled`
+
+```
+charge() fails  →  maybe_create_retry()  →  attempts scheduled (fixed/exponential/linear backoff)
+                        │                                              │
+                        └── auto_top_up (optional) ──────────────────┘
+                                                              │
+process_pending_retries()  ←── sweep due retries  ←──────────┘
+```
+
+```python
+from mcp_payments.engine import PaymentEngine
+
+engine = PaymentEngine()
+
+# Configure retry behavior for a customer
+config = engine.configure_retry(
+    customer_id=customer.id,
+    triggers=["insufficient_balance", "provider_timeout", "rate_limited"],
+    max_attempts=5,
+    strategy="exponential",       # fixed | exponential | linear
+    base_delay_seconds=30,
+    max_delay_seconds=3600,       # cap at 1 hour
+    auto_top_up=True,             # auto-replenish balance before retry
+    auto_top_up_amount=5000,      # $50.00
+)
+
+# Now any charge failure matching a trigger auto-creates a retry process
+payment = engine.charge(customer.id, amount=500, tool="premium-api")
+# If this fails with insufficient_balance, a PaymentRetry is created automatically
+
+# Manual control
+retry = engine.get_retry(retry_id)
+engine.execute_retry(retry_id)        # run next attempt now
+engine.pause_retry(retry_id)          # pause scheduled retries
+engine.resume_retry(retry_id)         # resume
+engine.cancel_retry(retry_id)         # stop retrying
+
+# Auto-recovery sweep — call on cron/interval
+processed = engine.process_pending_retries()  # all due retries across all customers
+
+# Monitor health
+stats = engine.get_retry_stats()
+# → {total_retries, active, succeeded, exhausted, recovery_rate, amount_recovered, ...}
+```
+
+**Failure classification:** Insufficient balance, provider timeout, rate limit, network error,
+declined. Each maps to configurable triggers — retry only what's recoverable.
+
+**Backoff strategies:**
+- **fixed** — same delay every attempt
+- **exponential** — delay doubles each attempt (default)
+- **linear** — delay increases by base each attempt
+
+**Config resolution:** Customer-specific config overrides global default. Most-restrictive-wins
+when multiple configs apply.
 
 ## Dispute Resolution (v0.7.0)
 
@@ -357,9 +432,9 @@ mcp-payments/
 │   ├── engine.py       # Payment processing engine (charge, escrow, split)
 │   ├── middleware.py   # x402 billing middleware (NEW v0.3.0)
 │   ├── storage.py      # JSON-backed storage (swap to SQL for production)
-│   ├── server/         # MCP server (53 tools)
+│   ├── server/         # MCP server (60 tools)
 │   └── cli/            # CLI interface
-├── tests/              # Comprehensive test suite (398 tests)
+├── tests/              # Comprehensive test suite (454 tests)
 └── docs/               # Documentation
 ```
 

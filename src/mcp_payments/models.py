@@ -586,3 +586,113 @@ class Dispute(BaseModel):
     split_percentage: Optional[float] = Field(default=None, ge=0, le=100, description="If RESOLVED_SPLIT: % to payer")
     expires_at: Optional[datetime] = Field(default=None, description="Auto-resolve deadline")
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── v0.8.0: Payment Retry & Auto-Recovery ──────────────────────────────────
+
+class RetryTrigger(str, Enum):
+    """What condition triggers a retry."""
+    INSUFFICIENT_BALANCE = "insufficient_balance"      # customer needs to top up
+    PROVIDER_TIMEOUT = "provider_timeout"               # external provider didn't respond
+    PROVIDER_ERROR = "provider_error"                   # 5xx / network error from provider
+    RATE_LIMITED = "rate_limited"                       # provider rate-limited the request
+    TRANSIENT_FAILURE = "transient_failure"             # any other recoverable error
+    ALL_FAILURES = "all_failures"                       # retry on any failure
+
+
+class RetryStrategy(str, Enum):
+    """How delays between retries are calculated."""
+    FIXED = "fixed"                # same delay every attempt
+    EXPONENTIAL = "exponential"    # delay *= backoff_multiplier each attempt
+    LINEAR = "linear"              # delay += initial_delay each attempt
+
+
+class RetryStatus(str, Enum):
+    """Lifecycle state of a payment retry process."""
+    ACTIVE = "active"              # retrying — more attempts remain
+    SUCCEEDED = "succeeded"        # a retry attempt succeeded
+    EXHAUSTED = "exhausted"        # all attempts used, still failing
+    CANCELLED = "cancelled"        # manually cancelled
+    PAUSED = "paused"              # temporarily paused
+
+
+class RetryConfig(BaseModel):
+    """Configuration for automatic payment retry behavior.
+
+    When a charge fails due to a recoverable condition (insufficient balance,
+    provider timeout, rate limit), the payment can be automatically retried
+    with configurable backoff instead of failing permanently.
+
+    Inspired by usehelix/helix (823⭐) proving demand for self-healing
+    agent payments. mcp-payments now has built-in retry — no external
+    infrastructure required.
+    """
+    id: str = Field(default_factory=lambda: f"rtcfg_{uuid.uuid4().hex[:24]}")
+    customer_id: Optional[str] = Field(default=None, description="Scope to a customer (None = global default)")
+    name: str = Field(default="default", description="Human-readable config name")
+    # What to retry
+    triggers: list[RetryTrigger] = Field(
+        default_factory=lambda: [RetryTrigger.INSUFFICIENT_BALANCE, RetryTrigger.PROVIDER_TIMEOUT],
+        description="Failure conditions that should trigger retries",
+    )
+    # Retry behavior
+    max_attempts: int = Field(default=3, ge=1, le=20, description="Maximum retry attempts (excluding original charge)")
+    strategy: RetryStrategy = Field(default=RetryStrategy.EXPONENTIAL)
+    initial_delay_seconds: float = Field(default=5.0, ge=0, description="Delay before first retry")
+    max_delay_seconds: float = Field(default=300.0, ge=0, description="Cap on delay between retries")
+    backoff_multiplier: float = Field(default=2.0, ge=1.0, description="Multiplier for exponential strategy")
+    # Auto-recovery
+    auto_top_up: bool = Field(default=False, description="If true, attempt auto top-up before retrying insufficient balance")
+    auto_top_up_amount: Optional[float] = Field(default=None, ge=0, description="Amount to auto top-up if enabled")
+    # State
+    enabled: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RetryAttempt(BaseModel):
+    """A single retry attempt within a payment retry process."""
+    attempt_number: int = Field(..., ge=1, description="1 = first retry (after original failure)")
+    scheduled_at: datetime
+    executed_at: Optional[datetime] = Field(default=None)
+    status: PaymentStatus = Field(default=PaymentStatus.PENDING)
+    delay_seconds: float = Field(default=0.0, description="Delay applied before this attempt")
+    failure_reason: Optional[str] = Field(default=None)
+    provider_transaction_id: Optional[str] = Field(default=None)
+
+
+class PaymentRetry(BaseModel):
+    """Tracks the retry lifecycle for a failed payment.
+
+    Created automatically when a charge fails with a retryable condition
+    and a matching RetryConfig exists. Each attempt is recorded with its
+    delay, outcome, and timing.
+    """
+    id: str = Field(default_factory=lambda: f"rtry_{uuid.uuid4().hex[:24]}")
+    original_payment_id: str = Field(..., description="The payment that failed")
+    customer_id: str = Field(...)
+    amount: float = Field(..., ge=0)
+    currency: Currency = Field(default=Currency.USD)
+    provider: PaymentProvider = Field(default=PaymentProvider.INTERNAL)
+    tool_name: Optional[str] = Field(default=None)
+    description: str = Field(default="")
+    # Config snapshot
+    config_id: str = Field(...)
+    max_attempts: int = Field(default=3)
+    strategy: RetryStrategy = Field(default=RetryStrategy.EXPONENTIAL)
+    trigger: RetryTrigger = Field(default=RetryTrigger.TRANSIENT_FAILURE)
+    initial_failure_reason: str = Field(default="")
+    # State
+    status: RetryStatus = Field(default=RetryStatus.ACTIVE)
+    attempts: list[RetryAttempt] = Field(default_factory=list)
+    current_attempt: int = Field(default=0, description="Attempts made so far (0 = none yet)")
+    next_attempt_at: Optional[datetime] = Field(default=None, description="When next retry should fire")
+    # Result
+    succeeded_payment_id: Optional[str] = Field(default=None, description="Payment ID if a retry succeeded")
+    final_status: Optional[PaymentStatus] = Field(default=None, description="Final payment status when exhausted")
+    # Timing
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = Field(default=None)
+    metadata: dict[str, Any] = Field(default_factory=dict)
