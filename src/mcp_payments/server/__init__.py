@@ -780,6 +780,104 @@ TOOL_DEFINITIONS = [
             "properties": {"customer_id": {"type": "string", "description": "Optional: scope stats to one customer"}},
         },
     },
+    # ── v0.9.0: Webhooks & Event Delivery ──
+    {
+        "name": "register_webhook",
+        "description": "Register a webhook endpoint to receive payment lifecycle events (payment.succeeded, dispute.opened, escrow.released, etc.). Events are HMAC-SHA256 signed. Use subscribed_events=['*'] for all, or filter like ['payment.*', 'dispute.opened'].",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "HTTPS endpoint URL to deliver events to"},
+                "secret": {"type": "string", "description": "Signing secret for HMAC-SHA256 payload verification"},
+                "description": {"type": "string", "default": ""},
+                "subscribed_events": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Event types to deliver. ['*'] = all. Supports prefixes like 'payment.*'",
+                },
+                "customer_id": {"type": "string", "description": "Scope to events for this customer only"},
+            },
+            "required": ["url", "secret"],
+        },
+    },
+    {
+        "name": "get_webhook",
+        "description": "Get details of a registered webhook endpoint by ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"endpoint_id": {"type": "string"}},
+            "required": ["endpoint_id"],
+        },
+    },
+    {
+        "name": "list_webhooks",
+        "description": "List registered webhook endpoints, optionally filtered by status or customer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["active", "disabled"]},
+                "customer_id": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "update_webhook",
+        "description": "Update a webhook endpoint configuration (url, subscribed_events, status, description).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "endpoint_id": {"type": "string"},
+                "url": {"type": "string"},
+                "subscribed_events": {"type": "array", "items": {"type": "string"}},
+                "status": {"type": "string", "enum": ["active", "disabled"]},
+                "description": {"type": "string"},
+            },
+            "required": ["endpoint_id"],
+        },
+    },
+    {
+        "name": "delete_webhook",
+        "description": "Delete a registered webhook endpoint. No further events will be delivered to it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"endpoint_id": {"type": "string"}},
+            "required": ["endpoint_id"],
+        },
+    },
+    {
+        "name": "list_events",
+        "description": "List payment lifecycle events, optionally filtered by type, customer, or delivery status. Events are emitted automatically when payments, refunds, disputes, escrows, etc. occur.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_type": {"type": "string", "description": "Filter by event type (e.g. 'payment.succeeded')"},
+                "customer_id": {"type": "string"},
+                "delivered": {"type": "boolean", "description": "Filter by delivery status"},
+            },
+        },
+    },
+    {
+        "name": "deliver_event",
+        "description": "Deliver a specific event to all subscribed, active webhook endpoints. Attempts HTTP POST with HMAC-SHA256 signature to each endpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "string"}},
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "deliver_pending_events",
+        "description": "Deliver all undelivered events to their subscribed endpoints. This is the delivery sweep — call periodically for automatic event delivery.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"customer_id": {"type": "string", "description": "Scope to one customer"}},
+        },
+    },
+    {
+        "name": "get_webhook_stats",
+        "description": "Get aggregate webhook delivery statistics — total endpoints, events, deliveries, delivery rate, breakdowns by event type.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -1865,5 +1963,116 @@ class MCPServer:
             "created_at": retry.created_at.isoformat(),
             "completed_at": retry.completed_at.isoformat() if retry.completed_at else None,
             "metadata": retry.metadata,
+        }
+
+    # ── v0.9.0: Webhooks & Event Delivery ──────────────────────────────
+
+    def _tool_register_webhook(self, args: dict) -> dict:
+        endpoint = self.engine.register_webhook_endpoint(
+            url=args["url"],
+            secret=args["secret"],
+            description=args.get("description", ""),
+            subscribed_events=args.get("subscribed_events"),
+            customer_id=args.get("customer_id"),
+        )
+        return self._serialize_webhook_endpoint(endpoint)
+
+    def _tool_get_webhook(self, args: dict) -> dict:
+        ep = self.engine.get_webhook_endpoint(args["endpoint_id"])
+        if ep is None:
+            return {"error": "Webhook endpoint not found"}
+        return self._serialize_webhook_endpoint(ep)
+
+    def _tool_list_webhooks(self, args: dict) -> dict:
+        endpoints = self.engine.list_webhook_endpoints(
+            status=args.get("status"),
+            customer_id=args.get("customer_id"),
+        )
+        return {
+            "count": len(endpoints),
+            "endpoints": [self._serialize_webhook_endpoint(e) for e in endpoints],
+        }
+
+    def _tool_update_webhook(self, args: dict) -> dict:
+        updates = {}
+        for key in ("url", "subscribed_events", "status", "description"):
+            if key in args:
+                updates[key] = args[key]
+        ep = self.engine.update_webhook_endpoint(args["endpoint_id"], **updates)
+        if ep is None:
+            return {"error": "Webhook endpoint not found"}
+        return self._serialize_webhook_endpoint(ep)
+
+    def _tool_delete_webhook(self, args: dict) -> dict:
+        deleted = self.engine.delete_webhook_endpoint(args["endpoint_id"])
+        return {"deleted": deleted}
+
+    def _tool_list_events(self, args: dict) -> dict:
+        events = self.engine.list_events(
+            event_type=args.get("event_type"),
+            customer_id=args.get("customer_id"),
+            delivered=args.get("delivered"),
+        )
+        return {
+            "count": len(events),
+            "events": [self._serialize_event(e) for e in events],
+        }
+
+    def _tool_deliver_event(self, args: dict) -> dict:
+        event = self.engine.deliver_event(args["event_id"])
+        return self._serialize_event(event)
+
+    def _tool_deliver_pending_events(self, args: dict) -> dict:
+        return self.engine.deliver_pending_events(args.get("customer_id"))
+
+    def _tool_get_webhook_stats(self, args: dict) -> dict:
+        return self.engine.get_webhook_stats()
+
+    def _serialize_webhook_endpoint(self, ep) -> dict:
+        """Serialize a WebhookEndpoint for JSON output."""
+        return {
+            "id": ep.id,
+            "url": ep.url,
+            "description": ep.description,
+            "subscribed_events": ep.subscribed_events,
+            "customer_id": ep.customer_id,
+            "status": ep.status.value,
+            "max_retries": ep.max_retries,
+            "timeout_seconds": ep.timeout_seconds,
+            "events_sent": ep.events_sent,
+            "events_failed": ep.events_failed,
+            "last_delivery_at": ep.last_delivery_at.isoformat() if ep.last_delivery_at else None,
+            "last_response_code": ep.last_response_code,
+            "created_at": ep.created_at.isoformat(),
+            "updated_at": ep.updated_at.isoformat(),
+        }
+
+    def _serialize_event(self, event) -> dict:
+        """Serialize a WebhookEvent for JSON output."""
+        return {
+            "id": event.id,
+            "type": event.type.value,
+            "customer_id": event.customer_id,
+            "payment_id": event.payment_id,
+            "escrow_id": event.escrow_id,
+            "dispute_id": event.dispute_id,
+            "retry_id": event.retry_id,
+            "data": event.data,
+            "delivered": event.delivered,
+            "deliveries": [
+                {
+                    "id": d.id,
+                    "endpoint_id": d.endpoint_id,
+                    "attempt": d.attempt,
+                    "status": d.status.value,
+                    "response_code": d.response_code,
+                    "error": d.error,
+                    "duration_ms": d.duration_ms,
+                    "started_at": d.started_at.isoformat() if d.started_at else None,
+                    "completed_at": d.completed_at.isoformat() if d.completed_at else None,
+                }
+                for d in event.deliveries
+            ],
+            "created_at": event.created_at.isoformat(),
         }
 

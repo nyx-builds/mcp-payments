@@ -24,6 +24,8 @@ from .models import (
     SubscriptionPlan,
     ToolPricing,
     UsageEvent,
+    WebhookEndpoint,
+    WebhookEvent,
 )
 
 
@@ -50,6 +52,8 @@ class Storage:
         self._disputes: dict[str, Dispute] = {}
         self._retry_configs: dict[str, RetryConfig] = {}
         self._payment_retries: dict[str, PaymentRetry] = {}
+        self._webhook_endpoints: dict[str, WebhookEndpoint] = {}
+        self._webhook_events: dict[str, WebhookEvent] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -74,6 +78,8 @@ class Storage:
             self._disputes = {d["id"]: Dispute(**d) for d in raw.get("disputes", [])}
             self._retry_configs = {rc["id"]: RetryConfig(**rc) for rc in raw.get("retry_configs", [])}
             self._payment_retries = {pr["id"]: PaymentRetry(**pr) for pr in raw.get("payment_retries", [])}
+            self._webhook_endpoints = {we["id"]: WebhookEndpoint(**we) for we in raw.get("webhook_endpoints", [])}
+            self._webhook_events = {ev["id"]: WebhookEvent(**ev) for ev in raw.get("webhook_events", [])}
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -94,6 +100,8 @@ class Storage:
             "disputes": [d.model_dump(mode="json") for d in self._disputes.values()],
             "retry_configs": [rc.model_dump(mode="json") for rc in self._retry_configs.values()],
             "payment_retries": [pr.model_dump(mode="json") for pr in self._payment_retries.values()],
+            "webhook_endpoints": [we.model_dump(mode="json") for we in self._webhook_endpoints.values()],
+            "webhook_events": [ev.model_dump(mode="json") for ev in self._webhook_events.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -739,3 +747,91 @@ class Storage:
                 self._save()
                 return True
             return False
+
+    # ── Webhook Endpoints ──────────────────────────────────────────────
+
+    def create_webhook_endpoint(self, endpoint: WebhookEndpoint) -> WebhookEndpoint:
+        with self._lock:
+            self._webhook_endpoints[endpoint.id] = endpoint
+            self._save()
+            return endpoint
+
+    def get_webhook_endpoint(self, endpoint_id: str) -> Optional[WebhookEndpoint]:
+        with self._lock:
+            return self._webhook_endpoints.get(endpoint_id)
+
+    def list_webhook_endpoints(
+        self,
+        status: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[WebhookEndpoint]:
+        with self._lock:
+            results = list(self._webhook_endpoints.values())
+            if status:
+                results = [e for e in results if e.status.value == status]
+            if customer_id:
+                results = [e for e in results if e.customer_id == customer_id or e.customer_id is None]
+            results.sort(key=lambda e: e.created_at, reverse=True)
+            return results[:limit]
+
+    def update_webhook_endpoint(self, endpoint_id: str, **kwargs) -> Optional[WebhookEndpoint]:
+        with self._lock:
+            ep = self._webhook_endpoints.get(endpoint_id)
+            if ep is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(ep, k) and v is not None:
+                    setattr(ep, k, v)
+            ep.updated_at = datetime.now(timezone.utc)
+            self._save()
+            return ep
+
+    def delete_webhook_endpoint(self, endpoint_id: str) -> bool:
+        with self._lock:
+            if endpoint_id in self._webhook_endpoints:
+                del self._webhook_endpoints[endpoint_id]
+                self._save()
+                return True
+            return False
+
+    # ── Webhook Events ─────────────────────────────────────────────────
+
+    def create_webhook_event(self, event: WebhookEvent) -> WebhookEvent:
+        with self._lock:
+            self._webhook_events[event.id] = event
+            self._save()
+            return event
+
+    def get_webhook_event(self, event_id: str) -> Optional[WebhookEvent]:
+        with self._lock:
+            return self._webhook_events.get(event_id)
+
+    def update_webhook_event(self, event_id: str, **kwargs) -> Optional[WebhookEvent]:
+        with self._lock:
+            ev = self._webhook_events.get(event_id)
+            if ev is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(ev, k) and v is not None:
+                    setattr(ev, k, v)
+            self._save()
+            return ev
+
+    def list_webhook_events(
+        self,
+        event_type: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        delivered: Optional[bool] = None,
+        limit: int = 100,
+    ) -> list[WebhookEvent]:
+        with self._lock:
+            results = list(self._webhook_events.values())
+            if event_type:
+                results = [e for e in results if e.type.value == event_type]
+            if customer_id:
+                results = [e for e in results if e.customer_id == customer_id]
+            if delivered is not None:
+                results = [e for e in results if e.delivered == delivered]
+            results.sort(key=lambda e: e.created_at, reverse=True)
+            return results[:limit]

@@ -696,3 +696,127 @@ class PaymentRetry(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = Field(default=None)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── Webhook Events (v0.9.0) ──────────────────────────────────────────────────
+
+class EventType(str, Enum):
+    """Payment lifecycle events that can trigger webhook delivery."""
+    # Payment events
+    PAYMENT_CREATED = "payment.created"
+    PAYMENT_SUCCEEDED = "payment.succeeded"
+    PAYMENT_FAILED = "payment.failed"
+    PAYMENT_REFUNDED = "payment.refunded"
+    # Customer events
+    CUSTOMER_CREATED = "customer.created"
+    CUSTOMER_BALANCE_UPDATED = "customer.balance_updated"
+    # Escrow events
+    ESCROW_CREATED = "escrow.created"
+    ESCROW_RELEASED = "escrow.released"
+    ESCROW_REFUNDED = "escrow.refunded"
+    # Dispute events
+    DISPUTE_OPENED = "dispute.opened"
+    DISPUTE_RESOLVED = "dispute.resolved"
+    DISPUTE_ESCALATED = "dispute.escalated"
+    # Retry events
+    RETRY_CREATED = "retry.created"
+    RETRY_SUCCEEDED = "retry.succeeded"
+    RETRY_EXHAUSTED = "retry.exhausted"
+    # Spend control events
+    SPEND_DENIED = "spend.denied"
+    # Marketplace events
+    SERVICE_PURCHASED = "service.purchased"
+    # Subscription events
+    SUBSCRIPTION_CREATED = "subscription.created"
+
+
+class WebhookEndpointStatus(str, Enum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
+class DeliveryStatus(str, Enum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"  # endpoint not subscribed to this event type
+
+
+class WebhookEndpoint(BaseModel):
+    """A registered webhook endpoint that receives event deliveries."""
+    id: str = Field(default_factory=lambda: f"hook_{uuid.uuid4().hex[:24]}")
+    url: str = Field(..., description="HTTPS endpoint URL to deliver events to")
+    secret: str = Field(..., description="HMAC-SHA256 signing secret for payload verification")
+    description: str = Field(default="")
+    subscribed_events: list[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Event types to deliver. ['*'] = all events.",
+    )
+    customer_id: Optional[str] = Field(
+        default=None,
+        description="If set, only events for this customer are delivered.",
+    )
+    status: WebhookEndpointStatus = Field(default=WebhookEndpointStatus.ACTIVE)
+    # Delivery config
+    max_retries: int = Field(default=3, ge=0, le=10, description="Max delivery retry attempts")
+    timeout_seconds: int = Field(default=10, ge=1, le=120)
+    # Stats
+    events_sent: int = Field(default=0)
+    events_failed: int = Field(default=0)
+    last_delivery_at: Optional[datetime] = Field(default=None)
+    last_response_code: Optional[int] = Field(default=None)
+    # Timing
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def is_subscribed(self, event_type: str) -> bool:
+        """Check if this endpoint is subscribed to a given event type."""
+        if "*" in self.subscribed_events:
+            return True
+        # Support wildcard prefixes like "payment.*"
+        for sub in self.subscribed_events:
+            if sub == event_type:
+                return True
+            if sub.endswith(".*"):
+                prefix = sub[:-1]  # "payment."
+                if event_type.startswith(prefix):
+                    return True
+        return False
+
+
+class WebhookDelivery(BaseModel):
+    """A single delivery attempt for a webhook event to an endpoint."""
+    id: str = Field(default_factory=lambda: f"dlv_{uuid.uuid4().hex[:24]}")
+    endpoint_id: str = Field(...)
+    event_id: str = Field(...)
+    attempt: int = Field(default=1, ge=1)
+    status: DeliveryStatus = Field(default=DeliveryStatus.PENDING)
+    request_payload: Optional[str] = Field(default=None, description="JSON payload sent")
+    response_code: Optional[int] = Field(default=None, description="HTTP response status code")
+    response_body: Optional[str] = Field(default=None, description="Response body (truncated)")
+    error: Optional[str] = Field(default=None, description="Error message if failed")
+    signature: Optional[str] = Field(default=None, description="HMAC-SHA256 signature sent")
+    started_at: Optional[datetime] = Field(default=None)
+    completed_at: Optional[datetime] = Field(default=None)
+    duration_ms: Optional[int] = Field(default=None, description="Delivery duration in ms")
+
+
+class WebhookEvent(BaseModel):
+    """A payment lifecycle event emitted by the engine for webhook delivery."""
+    id: str = Field(default_factory=lambda: f"evt_{uuid.uuid4().hex[:24]}")
+    type: EventType = Field(...)
+    customer_id: Optional[str] = Field(default=None)
+    # Related resource IDs
+    payment_id: Optional[str] = Field(default=None)
+    escrow_id: Optional[str] = Field(default=None)
+    dispute_id: Optional[str] = Field(default=None)
+    retry_id: Optional[str] = Field(default=None)
+    # Payload — the actual event data
+    data: dict[str, Any] = Field(default_factory=dict)
+    # Delivery tracking
+    deliveries: list[WebhookDelivery] = Field(default_factory=list)
+    delivered: bool = Field(default=False, description="True if at least one endpoint received it")
+    # Timing
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = Field(default_factory=dict)

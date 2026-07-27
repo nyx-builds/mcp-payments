@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from .models import (
     AuthorizationStatus,
     Currency,
     Customer,
+    DeliveryStatus,
     Dispute,
     DisputeEvidence,
     DisputeMessage,
@@ -21,6 +23,7 @@ from .models import (
     DisputeStatus,
     Escrow,
     EscrowStatus,
+    EventType,
     Payment,
     PaymentIntent,
     PaymentProvider,
@@ -50,6 +53,10 @@ from .models import (
     UsageEvent,
     UsageSummary,
     UsageUnit,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEndpointStatus,
+    WebhookEvent,
     X402PaymentRequirements,
 )
 from .storage import Storage
@@ -118,14 +125,27 @@ class PaymentEngine:
             email=email,
             metadata=metadata or {},
         )
-        return self.storage.create_customer(customer)
+        created = self.storage.create_customer(customer)
+        self._emit_event(
+            EventType.CUSTOMER_CREATED,
+            customer_id=created.id,
+            data={"name": created.name, "agent_id": created.agent_id},
+        )
+        return created
 
     def get_customer(self, customer_id: str) -> Optional[Customer]:
         return self.storage.get_customer(customer_id)
 
     def top_up_balance(self, customer_id: str, amount: float) -> Optional[Customer]:
         """Add prepaid balance to a customer account."""
-        return self.storage.update_customer_balance(customer_id, amount)
+        customer = self.storage.update_customer_balance(customer_id, amount)
+        if customer:
+            self._emit_event(
+                EventType.CUSTOMER_BALANCE_UPDATED,
+                customer_id=customer_id,
+                data={"new_balance": customer.balance, "top_up_amount": amount},
+            )
+        return customer
 
     # ── Payment Intents (x402 compatible) ──────────────────────────────
 
@@ -203,7 +223,7 @@ class PaymentEngine:
             tool_name=tool_name,
         )
         if not auth.authorized:
-            return self.storage.create_payment(Payment(
+            failed_payment = self.storage.create_payment(Payment(
                 customer_id=customer_id,
                 amount=amount,
                 currency=currency,
@@ -214,6 +234,19 @@ class PaymentEngine:
                 failure_reason=auth.reason,
                 metadata={**(metadata or {}), "authorization_status": auth.status.value},
             ))
+            self._emit_event(
+                EventType.SPEND_DENIED,
+                customer_id=customer_id,
+                payment_id=failed_payment.id,
+                data={"amount": amount, "tool_name": tool_name, "reason": auth.reason},
+            )
+            self._emit_event(
+                EventType.PAYMENT_FAILED,
+                customer_id=customer_id,
+                payment_id=failed_payment.id,
+                data={"amount": amount, "currency": currency.value, "tool_name": tool_name, "reason": auth.reason},
+            )
+            return failed_payment
 
         # Check pricing / free tier
         if tool_name:
@@ -267,6 +300,29 @@ class PaymentEngine:
                     result.id,
                     metadata={**result.metadata, "retry_id": retry.id},
                 )
+            self._emit_event(
+                EventType.PAYMENT_FAILED,
+                customer_id=customer_id,
+                payment_id=result.id,
+                data={
+                    "amount": amount,
+                    "currency": currency.value,
+                    "tool_name": tool_name,
+                    "reason": result.failure_reason or "unknown",
+                },
+            )
+        elif result.status == PaymentStatus.SUCCEEDED:
+            self._emit_event(
+                EventType.PAYMENT_SUCCEEDED,
+                customer_id=customer_id,
+                payment_id=result.id,
+                data={
+                    "amount": result.amount,
+                    "currency": result.currency.value,
+                    "tool_name": tool_name,
+                    "provider": result.provider.value,
+                },
+            )
 
         return result
 
@@ -400,6 +456,13 @@ class PaymentEngine:
         # Credit back customer balance for internal payments
         if payment.provider == PaymentProvider.INTERNAL:
             self.storage.update_customer_balance(payment.customer_id, refund_amount)
+
+        self._emit_event(
+            EventType.PAYMENT_REFUNDED,
+            customer_id=payment.customer_id,
+            payment_id=payment_id,
+            data={"refund_amount": refund_amount, "currency": payment.currency.value, "reason": reason},
+        )
 
         return refund
 
@@ -582,6 +645,19 @@ class PaymentEngine:
             released_at=datetime.now(timezone.utc),
             release_payment_id=release_payment.id,
         )
+        if updated:
+            self._emit_event(
+                EventType.ESCROW_RELEASED,
+                customer_id=escrow.payee_customer_id,
+                escrow_id=escrow_id,
+                payment_id=release_payment.id,
+                data={
+                    "amount": escrow.amount,
+                    "currency": escrow.currency.value,
+                    "payee_customer_id": escrow.payee_customer_id,
+                    "payer_customer_id": escrow.payer_customer_id,
+                },
+            )
         return updated
 
     def refund_escrow(self, escrow_id: str, reason: str = "") -> Optional[Escrow]:
@@ -595,12 +671,25 @@ class PaymentEngine:
         # Credit the payer back
         self.storage.update_customer_balance(escrow.payer_customer_id, escrow.amount)
 
-        return self.storage.update_escrow(
+        updated = self.storage.update_escrow(
             escrow_id,
             status=EscrowStatus.REFUNDED,
             refunded_at=datetime.now(timezone.utc),
             dispute_reason=reason or None,
         )
+        if updated:
+            self._emit_event(
+                EventType.ESCROW_REFUNDED,
+                customer_id=escrow.payer_customer_id,
+                escrow_id=escrow_id,
+                data={
+                    "amount": escrow.amount,
+                    "currency": escrow.currency.value,
+                    "payer_customer_id": escrow.payer_customer_id,
+                    "reason": reason,
+                },
+            )
+        return updated
 
     def dispute_escrow(self, escrow_id: str, reason: str) -> Optional[Escrow]:
         """Mark an escrow as disputed (payee claims non-release by payer)."""
@@ -1147,6 +1236,18 @@ class PaymentEngine:
                 free_tier_limit=service.free_tier_limit,
             )
 
+        self._emit_event(
+            EventType.SERVICE_PURCHASED,
+            customer_id=customer_id,
+            payment_id=payment.id,
+            data={
+                "service_id": service.id,
+                "service_name": service.name,
+                "amount": amount,
+                "payment_status": payment.status.value,
+            },
+        )
+
         return {
             "service_id": service.id,
             "service_name": service.name,
@@ -1235,6 +1336,19 @@ class PaymentEngine:
                 completed_at=datetime.now(timezone.utc),
             )
             self.storage.create_payment(payment)
+
+        self._emit_event(
+            EventType.SUBSCRIPTION_CREATED,
+            customer_id=customer_id,
+            payment_id=payment.id,
+            data={
+                "plan_id": plan.id,
+                "plan_name": plan.name,
+                "service_name": service.name,
+                "billing_interval": plan.billing_interval,
+                "amount": plan.price_cents,
+            },
+        )
 
         return {
             "plan_id": plan.id,
@@ -1707,6 +1821,20 @@ class PaymentEngine:
         # Mark the escrow as disputed
         self.storage.update_escrow(escrow_id, status=EscrowStatus.DISPUTED, dispute_reason=reason)
 
+        self._emit_event(
+            EventType.DISPUTE_OPENED,
+            customer_id=escrow.payer_customer_id,
+            escrow_id=escrow_id,
+            dispute_id=created.id,
+            data={
+                "amount": escrow.amount,
+                "currency": escrow.currency.value,
+                "filed_by": filed_by,
+                "category": category,
+                "reason": reason,
+            },
+        )
+
         return created
 
     def get_dispute(self, dispute_id: str) -> Optional[Dispute]:
@@ -1975,7 +2103,7 @@ class PaymentEngine:
             system=True,
         ))
 
-        return self.storage.update_dispute(
+        return_result = self.storage.update_dispute(
             dispute_id,
             status=status,
             resolved_at=now,
@@ -1984,6 +2112,21 @@ class PaymentEngine:
             split_percentage=split_percentage,
             messages=dispute.messages,
         )
+        if return_result:
+            self._emit_event(
+                EventType.DISPUTE_RESOLVED,
+                customer_id=escrow.payer_customer_id if escrow else None,
+                escrow_id=dispute.escrow_id,
+                dispute_id=dispute_id,
+                data={
+                    "outcome": outcome_lower,
+                    "amount": dispute.amount,
+                    "currency": dispute.currency.value,
+                    "resolved_by": resolved_by,
+                    "resolution": resolution,
+                },
+            )
+        return return_result
 
     def cancel_dispute(self, dispute_id: str, by_customer_id: str, reason: str = "") -> Optional[Dispute]:
         """Cancel (withdraw) a dispute. Only the filing party can cancel."""
@@ -2527,4 +2670,291 @@ class PaymentEngine:
             "average_attempts": avg_attempts,
             "by_status": by_status,
             "by_trigger": by_trigger,
+        }
+
+    # ── Webhook Events (v0.9.0) ────────────────────────────────────────
+
+    def register_webhook_endpoint(
+        self,
+        url: str,
+        secret: str,
+        description: str = "",
+        subscribed_events: Optional[list[str]] = None,
+        customer_id: Optional[str] = None,
+    ) -> WebhookEndpoint:
+        """Register a webhook endpoint to receive payment lifecycle events.
+
+        When events occur (payment.succeeded, escrow.released, dispute.opened, etc.),
+        the engine records them and they can be delivered to registered endpoints.
+        Use subscribed_events=['*'] for all events, or filter like ['payment.*', 'dispute.opened'].
+        """
+        endpoint = WebhookEndpoint(
+            url=url,
+            secret=secret,
+            description=description,
+            subscribed_events=subscribed_events or ["*"],
+            customer_id=customer_id,
+        )
+        return self.storage.create_webhook_endpoint(endpoint)
+
+    def get_webhook_endpoint(self, endpoint_id: str) -> Optional[WebhookEndpoint]:
+        return self.storage.get_webhook_endpoint(endpoint_id)
+
+    def list_webhook_endpoints(
+        self,
+        status: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[WebhookEndpoint]:
+        return self.storage.list_webhook_endpoints(
+            status=status, customer_id=customer_id, limit=limit
+        )
+
+    def update_webhook_endpoint(
+        self,
+        endpoint_id: str,
+        **kwargs,
+    ) -> Optional[WebhookEndpoint]:
+        """Update endpoint config (url, subscribed_events, status, description)."""
+        return self.storage.update_webhook_endpoint(endpoint_id, **kwargs)
+
+    def delete_webhook_endpoint(self, endpoint_id: str) -> bool:
+        return self.storage.delete_webhook_endpoint(endpoint_id)
+
+    def _emit_event(
+        self,
+        event_type: EventType,
+        customer_id: Optional[str] = None,
+        payment_id: Optional[str] = None,
+        escrow_id: Optional[str] = None,
+        dispute_id: Optional[str] = None,
+        retry_id: Optional[str] = None,
+        data: Optional[dict[str, Any]] = None,
+    ) -> WebhookEvent:
+        """Internal: create and store a payment lifecycle event.
+
+        Called by charge(), refund_payment(), release_escrow(), open_dispute(), etc.
+        Events are stored and can be delivered via deliver_pending_events() or
+        redelivered manually.
+        """
+        event = WebhookEvent(
+            type=event_type,
+            customer_id=customer_id,
+            payment_id=payment_id,
+            escrow_id=escrow_id,
+            dispute_id=dispute_id,
+            retry_id=retry_id,
+            data=data or {},
+        )
+        return self.storage.create_webhook_event(event)
+
+    def list_events(
+        self,
+        event_type: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        delivered: Optional[bool] = None,
+        limit: int = 100,
+    ) -> list[WebhookEvent]:
+        """List payment lifecycle events, with optional filters."""
+        return self.storage.list_webhook_events(
+            event_type=event_type,
+            customer_id=customer_id,
+            delivered=delivered,
+            limit=limit,
+        )
+
+    def get_event(self, event_id: str) -> Optional[WebhookEvent]:
+        return self.storage.get_webhook_event(event_id)
+
+    def deliver_event(self, event_id: str) -> WebhookEvent:
+        """Deliver an event to all subscribed, active endpoints.
+
+        Attempts HTTP POST to each endpoint with HMAC-SHA256 signature.
+        Records delivery results (success/failure) on the event.
+        Note: In test/offline mode, endpoints with localhost or example URLs
+        are simulated as successful.
+        """
+        event = self.storage.get_webhook_event(event_id)
+        if event is None:
+            raise ValueError(f"Event {event_id} not found")
+
+        endpoints = self.storage.list_webhook_endpoints(status="active")
+        any_delivered = False
+
+        for ep in endpoints:
+            # Filter by customer scope
+            if ep.customer_id and event.customer_id and ep.customer_id != event.customer_id:
+                continue
+            # Filter by event subscription
+            if not ep.is_subscribed(event.type.value):
+                continue
+
+            # Build payload
+            payload = json.dumps({
+                "id": event.id,
+                "type": event.type.value,
+                "created_at": event.created_at.isoformat(),
+                "customer_id": event.customer_id,
+                "payment_id": event.payment_id,
+                "escrow_id": event.escrow_id,
+                "dispute_id": event.dispute_id,
+                "retry_id": event.retry_id,
+                "data": event.data,
+            })
+            signature = self.generate_webhook_signature(payload.encode(), ep.secret)
+
+            # Attempt delivery (simulated in offline mode)
+            delivery = self._attempt_delivery(ep, event, payload, signature)
+            event.deliveries.append(delivery)
+
+            if delivery.status == DeliveryStatus.SUCCEEDED:
+                any_delivered = True
+                ep.events_sent += 1
+            elif delivery.status == DeliveryStatus.FAILED:
+                ep.events_failed += 1
+
+            ep.last_delivery_at = datetime.now(timezone.utc)
+            ep.last_response_code = delivery.response_code
+            self.storage.update_webhook_endpoint(ep.id)
+
+        event.delivered = any_delivered
+        self.storage.update_webhook_event(
+            event.id, deliveries=event.deliveries, delivered=event.delivered
+        )
+        return event
+
+    def _attempt_delivery(
+        self,
+        endpoint: WebhookEndpoint,
+        event: WebhookEvent,
+        payload: str,
+        signature: str,
+    ) -> WebhookDelivery:
+        """Attempt a single HTTP delivery. Simulated for non-production URLs."""
+        import time as _time
+
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint.id,
+            event_id=event.id,
+            attempt=1,
+            request_payload=payload,
+            signature=signature,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        # Simulate delivery for test/example/localhost URLs
+        url_lower = endpoint.url.lower()
+        is_simulated = any(
+            d in url_lower
+            for d in ["localhost", "127.0.0.1", "example.com", "example.org", "test"]
+        )
+
+        if is_simulated:
+            delivery.status = DeliveryStatus.SUCCEEDED
+            delivery.response_code = 200
+            delivery.response_body = '{"status": "received"}'
+        else:
+            # Real HTTP delivery attempt
+            try:
+                import httpx
+
+                resp = httpx.post(
+                    endpoint.url,
+                    content=payload.encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Webhook-Signature": signature,
+                        "X-Event-Type": event.type.value,
+                        "X-Event-Id": event.id,
+                    },
+                    timeout=endpoint.timeout_seconds,
+                )
+                delivery.response_code = resp.status_code
+                delivery.response_body = resp.text[:500]
+                if 200 <= resp.status_code < 300:
+                    delivery.status = DeliveryStatus.SUCCEEDED
+                else:
+                    delivery.status = DeliveryStatus.FAILED
+                    delivery.error = f"HTTP {resp.status_code}"
+            except Exception as e:
+                delivery.status = DeliveryStatus.FAILED
+                delivery.error = str(e)
+
+        delivery.completed_at = datetime.now(timezone.utc)
+        if delivery.started_at and delivery.completed_at:
+            delta = (delivery.completed_at - delivery.started_at).total_seconds()
+            delivery.duration_ms = int(delta * 1000)
+
+        return delivery
+
+    def deliver_pending_events(self, customer_id: Optional[str] = None) -> dict[str, Any]:
+        """Deliver all undelivered events to their subscribed endpoints.
+
+        Call this on a cron/interval for automatic event delivery.
+        Returns summary stats.
+        """
+        events = self.storage.list_webhook_events(
+            customer_id=customer_id, delivered=False, limit=10000
+        )
+        delivered_count = 0
+        failed_count = 0
+
+        for event in events:
+            result = self.deliver_event(event.id)
+            if result.delivered:
+                delivered_count += 1
+            else:
+                failed_count += 1
+
+        return {
+            "total_pending": len(events),
+            "delivered": delivered_count,
+            "failed": failed_count,
+        }
+
+    def redeliver_event(self, event_id: str) -> Optional[WebhookEvent]:
+        """Re-deliver an event to all endpoints (even if previously delivered)."""
+        # Reset delivered flag to force re-delivery
+        self.storage.update_webhook_event(event_id, delivered=False, deliveries=[])
+        return self.deliver_event(event_id)
+
+    def get_webhook_stats(self) -> dict[str, Any]:
+        """Aggregate webhook delivery statistics."""
+        endpoints = self.storage.list_webhook_endpoints(limit=10000)
+        events = self.storage.list_webhook_events(limit=100000)
+
+        total_endpoints = len(endpoints)
+        active_endpoints = sum(1 for e in endpoints if e.status == WebhookEndpointStatus.ACTIVE)
+        total_events = len(events)
+        delivered_events = sum(1 for e in events if e.delivered)
+
+        # Count deliveries by status
+        total_deliveries = 0
+        succeeded_deliveries = 0
+        failed_deliveries = 0
+        by_event_type: dict[str, int] = {}
+
+        for ev in events:
+            by_event_type[ev.type.value] = by_event_type.get(ev.type.value, 0) + 1
+            for d in ev.deliveries:
+                total_deliveries += 1
+                if d.status == DeliveryStatus.SUCCEEDED:
+                    succeeded_deliveries += 1
+                elif d.status == DeliveryStatus.FAILED:
+                    failed_deliveries += 1
+
+        delivery_rate = round(succeeded_deliveries / total_deliveries * 100, 1) if total_deliveries else 0.0
+
+        return {
+            "total_endpoints": total_endpoints,
+            "active_endpoints": active_endpoints,
+            "disabled_endpoints": total_endpoints - active_endpoints,
+            "total_events": total_events,
+            "delivered_events": delivered_events,
+            "undelivered_events": total_events - delivered_events,
+            "total_deliveries": total_deliveries,
+            "succeeded_deliveries": succeeded_deliveries,
+            "failed_deliveries": failed_deliveries,
+            "delivery_rate": delivery_rate,
+            "by_event_type": by_event_type,
         }

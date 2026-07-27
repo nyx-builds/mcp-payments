@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 60
+        assert len(TOOL_DEFINITIONS) == 69
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -69,6 +69,11 @@ class TestToolDefinitions:
             "configure_retry", "get_retry", "list_retries",
             "execute_retry", "process_pending_retries", "cancel_retry",
             "get_retry_stats",
+            # v0.9.0
+            "register_webhook", "get_webhook", "list_webhooks",
+            "update_webhook", "delete_webhook",
+            "list_events", "deliver_event", "deliver_pending_events",
+            "get_webhook_stats",
         }
         assert names == expected
 
@@ -76,7 +81,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 60
+        assert len(tools) == 69
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()
