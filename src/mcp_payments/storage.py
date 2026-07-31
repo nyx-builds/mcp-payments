@@ -11,6 +11,7 @@ from .models import (
     Customer,
     Dispute,
     Escrow,
+    IdempotencyRecord,
     Payment,
     PaymentIntent,
     PaymentStatus,
@@ -54,6 +55,7 @@ class Storage:
         self._payment_retries: dict[str, PaymentRetry] = {}
         self._webhook_endpoints: dict[str, WebhookEndpoint] = {}
         self._webhook_events: dict[str, WebhookEvent] = {}
+        self._idempotency_records: dict[str, IdempotencyRecord] = {}
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -80,6 +82,10 @@ class Storage:
             self._payment_retries = {pr["id"]: PaymentRetry(**pr) for pr in raw.get("payment_retries", [])}
             self._webhook_endpoints = {we["id"]: WebhookEndpoint(**we) for we in raw.get("webhook_endpoints", [])}
             self._webhook_events = {ev["id"]: WebhookEvent(**ev) for ev in raw.get("webhook_events", [])}
+            self._idempotency_records = {
+                f"{r['customer_id']}:{r['key']}": IdempotencyRecord(**r)
+                for r in raw.get("idempotency_records", [])
+            }
         except Exception:
             pass  # Corrupt DB — start fresh
 
@@ -102,6 +108,7 @@ class Storage:
             "payment_retries": [pr.model_dump(mode="json") for pr in self._payment_retries.values()],
             "webhook_endpoints": [we.model_dump(mode="json") for we in self._webhook_endpoints.values()],
             "webhook_events": [ev.model_dump(mode="json") for ev in self._webhook_events.values()],
+            "idempotency_records": [r.model_dump(mode="json") for r in self._idempotency_records.values()],
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._db_path.with_suffix(".tmp")
@@ -835,3 +842,73 @@ class Storage:
                 results = [e for e in results if e.delivered == delivered]
             results.sort(key=lambda e: e.created_at, reverse=True)
             return results[:limit]
+
+    # ── Idempotency Records (v1.0.0) ──────────────────────────────────
+
+    def _idem_key(self, customer_id: str, key: str) -> str:
+        """Composite key for idempotency records: customer:key."""
+        return f"{customer_id}:{key}"
+
+    def get_idempotency_record(self, customer_id: str, key: str) -> Optional[IdempotencyRecord]:
+        with self._lock:
+            record = self._idempotency_records.get(self._idem_key(customer_id, key))
+            if record is None:
+                return None
+            # Check expiry
+            if datetime.now(timezone.utc) > record.expires_at:
+                del self._idempotency_records[self._idem_key(customer_id, key)]
+                self._save()
+                return None
+            return record
+
+    def create_idempotency_record(self, record: IdempotencyRecord) -> IdempotencyRecord:
+        with self._lock:
+            self._idempotency_records[self._idem_key(record.customer_id, record.key)] = record
+            self._save()
+            return record
+
+    def update_idempotency_record(self, customer_id: str, key: str, **kwargs) -> Optional[IdempotencyRecord]:
+        with self._lock:
+            record = self._idempotency_records.get(self._idem_key(customer_id, key))
+            if record is None:
+                return None
+            for k, v in kwargs.items():
+                if hasattr(record, k) and v is not None:
+                    setattr(record, k, v)
+            self._save()
+            return record
+
+    def list_idempotency_records(
+        self,
+        customer_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[IdempotencyRecord]:
+        with self._lock:
+            results = list(self._idempotency_records.values())
+            if customer_id:
+                results = [r for r in results if r.customer_id == customer_id]
+            results.sort(key=lambda r: r.created_at, reverse=True)
+            return results[:limit]
+
+    def delete_idempotency_record(self, customer_id: str, key: str) -> bool:
+        with self._lock:
+            ck = self._idem_key(customer_id, key)
+            if ck in self._idempotency_records:
+                del self._idempotency_records[ck]
+                self._save()
+                return True
+            return False
+
+    def cleanup_expired_idempotency(self) -> int:
+        """Remove all expired idempotency records. Returns count removed."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            expired = [
+                ck for ck, r in self._idempotency_records.items()
+                if now > r.expires_at
+            ]
+            for ck in expired:
+                del self._idempotency_records[ck]
+            if expired:
+                self._save()
+            return len(expired)

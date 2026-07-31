@@ -609,7 +609,7 @@ class TestMCPServer:
     def test_tool_count(self, server):
         """Should now have 69 tools (was 60, +9 webhook tools)."""
         tools = server.list_tools()
-        assert len(tools) == 69
+        assert len(tools) == 71
 
     def test_configure_retry_via_server(self, server, customer):
         result = server.call_tool("configure_retry", {

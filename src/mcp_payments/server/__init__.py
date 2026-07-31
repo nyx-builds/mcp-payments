@@ -102,6 +102,7 @@ TOOL_DEFINITIONS = [
                 "tool_name": {"type": "string"},
                 "description": {"type": "string"},
                 "provider": {"type": "string", "enum": [p.value for p in PaymentProvider], "default": "internal"},
+                "idempotency_key": {"type": "string", "description": "Unique key to prevent duplicate charges on retries. If a charge with this key already completed, returns the original result instead of creating a new charge."},
             },
             "required": ["customer_id", "amount"],
         },
@@ -878,6 +879,26 @@ TOOL_DEFINITIONS = [
         "description": "Get aggregate webhook delivery statistics — total endpoints, events, deliveries, delivery rate, breakdowns by event type.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "export_data",
+        "description": "Export payment data in JSON or CSV format for accounting reconciliation, reporting, or backup.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string", "enum": ["payments", "customers", "refunds", "escrows", "splits", "usage_events", "spend_policies", "disputes", "services"], "default": "payments"},
+                "format": {"type": "string", "enum": ["json", "csv"], "default": "json"},
+                "customer_id": {"type": "string", "description": "Filter to specific customer"},
+                "status": {"type": "string", "description": "Filter by status (e.g. 'succeeded', 'held')"},
+                "limit": {"type": "integer", "default": 10000},
+            },
+            "required": ["resource"],
+        },
+    },
+    {
+        "name": "system_health",
+        "description": "Get a full system health snapshot — counts, balances, success rates, and status across all payment system components.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -1004,6 +1025,7 @@ class MCPServer:
             description=args.get("description", ""),
             provider=PaymentProvider(args.get("provider", "internal")),
             metadata=args.get("metadata"),
+            idempotency_key=args.get("idempotency_key"),
         )
         return {
             "payment_id": payment.id,
@@ -2075,4 +2097,19 @@ class MCPServer:
             ],
             "created_at": event.created_at.isoformat(),
         }
+
+    # ── v1.0.0 Tool Handlers ──────────────────────────────────────────
+
+    def _tool_export_data(self, args: dict) -> dict:
+        data = self.engine.export_data(
+            resource=args.get("resource", "payments"),
+            format=args.get("format", "json"),
+            customer_id=args.get("customer_id"),
+            status=args.get("status"),
+            limit=args.get("limit", 10000),
+        )
+        return {"resource": args.get("resource", "payments"), "format": args.get("format", "json"), "data": data}
+
+    def _tool_system_health(self, args: dict) -> dict:
+        return self.engine.system_health()
 

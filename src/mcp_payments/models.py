@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -820,3 +820,39 @@ class WebhookEvent(BaseModel):
     # Timing
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── v1.0.0: Idempotency (production-safe charge deduplication) ────────────
+
+class IdempotencyRecord(BaseModel):
+    """Maps an idempotency key to a completed operation result.
+
+    When an agent retries a charge with the same idempotency key, the
+    engine returns the cached result instead of creating a duplicate
+    payment. This is critical for network-failure resilience: if an
+    agent times out waiting for a charge response, it can safely retry
+    the same operation.
+
+    Idempotency keys are scoped per customer to prevent cross-customer
+    collisions.
+
+    Keys expire after 24h (configurable) to prevent unbounded storage
+    growth.
+    """
+    key: str = Field(..., description="Client-provided idempotency key (e.g. UUID)")
+    customer_id: str = Field(..., description="Customer ID this key is scoped to")
+    operation: str = Field(default="charge", description="What operation this guards")
+    # Cached result — the payment that was created
+    payment_id: Optional[str] = Field(default=None, description="Payment ID from the first successful execution")
+    result: Optional[dict[str, Any]] = Field(default=None, description="Serialized result to return on replay")
+    # State tracking
+    in_progress: bool = Field(default=False, description="True while the first call is executing")
+    completed: bool = Field(default=False, description="True once the operation finished (success or failure)")
+    error: Optional[str] = Field(default=None, description="Error message if the first attempt failed")
+    # Timing
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = Field(default=None)
+    expires_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=24),
+        description="When this record expires and can be replaced",
+    )

@@ -380,5 +380,30 @@ def settle(customer_id, tool):
             console.print(f"    {tl}: {info['events']} events → ${info['cost']:.4f} [{status_color}]{'charged' if info.get('charged') else 'no charge'}[/]")
 
 
+@cli.command()
+def stdio() -> None:
+    """Run the MCP server on stdio transport (for MCP clients)."""
+    from ..transport import run_stdio
+    run_stdio()
+
+
+@cli.command()
+def serve() -> None:
+    """Print MCP server configuration for reference."""
+    from ..server import MCPServer
+    server = MCPServer()
+    config = {
+        "mcpServers": {
+            "mcp-payments": {
+                "command": "mcp-payments",
+                "args": ["stdio"],
+            }
+        },
+        "tools": [t["name"] for t in server.list_tools()],
+        "tool_count": len(server.list_tools()),
+    }
+    console.print_json(data=config)
+
+
 if __name__ == "__main__":
     cli()

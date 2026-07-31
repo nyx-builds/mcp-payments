@@ -208,8 +208,39 @@ class PaymentEngine:
         description: str = "",
         provider: PaymentProvider = PaymentProvider.INTERNAL,
         metadata: dict | None = None,
+        idempotency_key: str | None = None,
     ) -> Payment:
-        """Charge a customer. Deducts from prepaid balance for internal payments."""
+        """Charge a customer. Deducts from prepaid balance for internal payments.
+
+        If an idempotency_key is provided and a previous charge with the same
+        key (for this customer) already completed, returns the cached result
+        instead of creating a duplicate charge.
+        """
+
+        # ── v1.0.0: Idempotency check ──
+        if idempotency_key:
+            existing = self.storage.get_idempotency_record(customer_id, idempotency_key)
+            if existing and existing.completed:
+                # Replay the cached result
+                if existing.payment_id:
+                    payment = self.storage.get_payment(existing.payment_id)
+                    if payment:
+                        return payment
+            # Mark in-progress to prevent concurrent duplicates
+            if existing is None:
+                from .models import IdempotencyRecord
+                self.storage.create_idempotency_record(IdempotencyRecord(
+                    key=idempotency_key,
+                    customer_id=customer_id,
+                    operation="charge",
+                    in_progress=True,
+                    expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+                ))
+            elif existing.in_progress and not existing.completed:
+                raise ValueError(
+                    f"Idempotency key '{idempotency_key}' is already being processed. "
+                    "Retry in a moment."
+                )
 
         # Validate customer exists
         customer = self.storage.get_customer(customer_id)
@@ -318,10 +349,21 @@ class PaymentEngine:
                 payment_id=result.id,
                 data={
                     "amount": result.amount,
-                    "currency": result.currency.value,
+                    "currency": currency.value,
                     "tool_name": tool_name,
                     "provider": result.provider.value,
                 },
+            )
+
+        # ── v1.0.0: Record idempotency result ──
+        if idempotency_key:
+            self.storage.update_idempotency_record(
+                customer_id=customer_id,
+                key=idempotency_key,
+                in_progress=False,
+                completed=True,
+                payment_id=result.id,
+                completed_at=datetime.now(timezone.utc),
             )
 
         return result
@@ -2957,4 +2999,172 @@ class PaymentEngine:
             "failed_deliveries": failed_deliveries,
             "delivery_rate": delivery_rate,
             "by_event_type": by_event_type,
+        }
+
+    # ── v1.0.0: Data Export ────────────────────────────────────────────
+
+    def export_data(
+        self,
+        resource: str = "payments",
+        format: str = "json",
+        customer_id: str | None = None,
+        status: str | None = None,
+        limit: int = 10000,
+    ) -> str:
+        """Export data in JSON or CSV format for accounting and reconciliation.
+
+        Args:
+            resource: What to export — payments, customers, refunds, escrows,
+                      splits, usage_events, spend_policies, disputes, services
+            format: 'json' or 'csv'
+            customer_id: Optional customer filter
+            status: Optional status filter
+            limit: Max records to export
+
+        Returns:
+            Serialized data string (JSON or CSV)
+        """
+        records: list[Any] = []
+
+        if resource == "payments":
+            pay_status = PaymentStatus(status) if status else None
+            records = self.storage.list_payments(
+                customer_id=customer_id, status=pay_status, limit=limit,
+            )
+        elif resource == "customers":
+            records = self.storage.list_customers(limit=limit)
+        elif resource == "refunds":
+            refunds = self.storage.list_refunds(payment_id=None)
+            records = refunds[:limit]
+        elif resource == "escrows":
+            records = self.storage.list_escrows(
+                payer_id=customer_id, status=status, limit=limit,
+            )
+        elif resource == "splits":
+            records = self.storage.list_splits(
+                payer_id=customer_id, status=status, limit=limit,
+            )
+        elif resource == "usage_events":
+            records = self.storage.list_usage_events(
+                customer_id=customer_id, limit=limit,
+            )
+        elif resource == "spend_policies":
+            records = self.storage.list_spend_policies(customer_id=customer_id)
+        elif resource == "disputes":
+            records = self.storage.list_disputes(
+                customer_id=customer_id, status=status, limit=limit,
+            )
+        elif resource == "services":
+            records = self.storage.list_services(
+                status=status, limit=limit,
+            )
+        else:
+            raise ValueError(
+                f"Unknown resource: {resource}. "
+                "Valid: payments, customers, refunds, escrows, splits, "
+                "usage_events, spend_policies, disputes, services"
+            )
+
+        # Serialize
+        if format == "json":
+            return json.dumps(
+                [r.model_dump(mode="json") for r in records],
+                indent=2, default=str,
+            )
+        elif format == "csv":
+            if not records:
+                return ""
+            import csv
+            import io
+            data = [r.model_dump(mode="json") for r in records]
+            output = io.StringIO()
+            # Flatten nested fields for CSV
+            flat_data = []
+            for row in data:
+                flat = {}
+                for k, v in row.items():
+                    if isinstance(v, dict):
+                        flat[k] = json.dumps(v, default=str)
+                    elif isinstance(v, list):
+                        flat[k] = json.dumps(v, default=str)
+                    else:
+                        flat[k] = v
+                flat_data.append(flat)
+            writer = csv.DictWriter(output, fieldnames=flat_data[0].keys())
+            writer.writeheader()
+            writer.writerows(flat_data)
+            return output.getvalue()
+        else:
+            raise ValueError(f"Unknown format: {format}. Use 'json' or 'csv'.")
+
+    # ── v1.0.0: System Health ──────────────────────────────────────────
+
+    def system_health(self) -> dict[str, Any]:
+        """Full system health snapshot — counts, balances, and status.
+
+        Returns aggregate stats across all payment system components:
+        customers, payments, escrows, disputes, retries, webhooks,
+        marketplace, and idempotency records.
+        """
+        customers = self.storage.list_customers(limit=100000)
+        payments = self.storage.list_payments(limit=100000)
+        escrows = self.storage.list_escrows(limit=100000)
+        disputes = self.storage.list_disputes(limit=100000)
+        services = self.storage.list_services(limit=100000)
+
+        # Payment stats
+        total_volume = sum(p.amount for p in payments if p.status == PaymentStatus.SUCCEEDED)
+        total_refunded = sum(p.refund_amount for p in payments)
+        succeeded = [p for p in payments if p.status == PaymentStatus.SUCCEEDED]
+        failed = [p for p in payments if p.status == PaymentStatus.FAILED]
+        success_rate = round(len(succeeded) / len(payments) * 100, 1) if payments else 0.0
+
+        # Customer balances
+        total_balance = sum(c.balance for c in customers)
+
+        # Escrow stats
+        held_escrows = [e for e in escrows if e.status == EscrowStatus.HELD]
+        held_amount = sum(e.amount for e in held_escrows)
+
+        # Dispute stats
+        open_disputes = [d for d in disputes if d.status.value == "opened"]
+
+        # Marketplace stats
+        active_services = [s for s in services if s.status.value == "active"]
+
+        # Idempotency records
+        idem_records = self.storage.list_idempotency_records(limit=100000)
+
+        return {
+            "version": "1.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "customers": {
+                "total": len(customers),
+                "total_balance_cents": total_balance,
+            },
+            "payments": {
+                "total": len(payments),
+                "succeeded": len(succeeded),
+                "failed": len(failed),
+                "success_rate": success_rate,
+                "total_volume_cents": total_volume,
+                "total_refunded_cents": total_refunded,
+            },
+            "escrows": {
+                "total": len(escrows),
+                "held": len(held_escrows),
+                "held_amount_cents": held_amount,
+            },
+            "disputes": {
+                "total": len(disputes),
+                "open": len(open_disputes),
+            },
+            "marketplace": {
+                "total_services": len(services),
+                "active_services": len(active_services),
+            },
+            "idempotency": {
+                "total_records": len(idem_records),
+            },
+            "status": "healthy",
         }

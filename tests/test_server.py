@@ -15,7 +15,7 @@ def server(tmp_path):
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 69
+        assert len(TOOL_DEFINITIONS) == 71
 
     def test_all_have_names(self):
         for tool in TOOL_DEFINITIONS:
@@ -74,6 +74,8 @@ class TestToolDefinitions:
             "update_webhook", "delete_webhook",
             "list_events", "deliver_event", "deliver_pending_events",
             "get_webhook_stats",
+            # v1.0.0
+            "export_data", "system_health",
         }
         assert names == expected
 
@@ -81,7 +83,7 @@ class TestToolDefinitions:
 class TestToolList:
     def test_list_tools(self, server):
         tools = server.list_tools()
-        assert len(tools) == 69
+        assert len(tools) == 71
 
     def test_list_tools_returns_definitions(self, server):
         tools = server.list_tools()
